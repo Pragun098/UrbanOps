@@ -1,0 +1,40 @@
+# /etc/mongod.conf
+# ==============================================================================
+# UrbanOps - Secure MongoDB Server Configuration
+# ==============================================================================
+# Path: /etc/mongod.conf
+# Apply changes: sudo systemctl restart mongod
+# ==============================================================================
+
+# Network interfaces configuration
+net:
+  port: 27017
+  # CRITICAL SECURITY: Bind exclusively to localhost and/or internal private network interfaces.
+  # NEVER bind to 0.0.0.0 in production environments.
+  # Format: comma-separated list of ip addresses / hostnames
+  bindIp: 127.0.0.1
+  # Example when binding to localhost AND a trusted VPC private subnet IP:
+  # bindIp: 127.0.0.1,10.0.0.10
+  maxIncomingConnections: 1000
+
+# Security and access control configuration
+security:
+  # CRITICAL SECURITY: Enforce Role-Based Access Control (RBAC) authentication.
+  # Requires users to authenticate before executing queries or administrative tasks.
+  authorization: enabled
+
+# Where and how to store data.
+storage:
+  dbPath: /var/lib/mongodb
+  journal:
+    enabled: true
+
+# Where to log system activity
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+
+# Process management
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
