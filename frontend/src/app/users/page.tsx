@@ -15,7 +15,16 @@ import { MANAGER_ROLES, ROLE_SUMMARY, useAuth } from "@/lib/auth";
 import { StateOptions, copyText } from "@/lib/regions";
 
 type Row = User & { createdAt?: string };
-type Credential = { name: string; email: string; password: string; reason: "created" | "reset" };
+type Credential = {
+  name: string;
+  email: string;
+  password: string;
+  reason: "created" | "reset";
+  emailed?: boolean;
+  emailError?: string;
+  previewUrl?: string;
+};
+type CredentialResponse = { user: User; temporaryPassword: string; emailed?: boolean; emailError?: string; previewUrl?: string };
 
 const PAGE_SIZE = 25;
 
@@ -87,8 +96,16 @@ function Team() {
   const resetPassword = (row: Row) =>
     act(row, async () => {
       if (!window.confirm(`Reset ${row.name}'s password? They'll need the new temporary password to sign in.`)) return;
-      const res = await api<{ temporaryPassword: string }>(`/users/${row._id}/reset-password`, { method: "POST" });
-      setCredential({ name: row.name, email: row.email, password: res.temporaryPassword, reason: "reset" });
+      const res = await api<CredentialResponse>(`/users/${row._id}/reset-password`, { method: "POST" });
+      setCredential({
+        name: row.name,
+        email: row.email,
+        password: res.temporaryPassword,
+        reason: "reset",
+        emailed: res.emailed,
+        emailError: res.emailError,
+        previewUrl: res.previewUrl,
+      });
       reload();
     });
 
@@ -272,7 +289,7 @@ function AddDispatcher({ isSuper, onCreated }: { isSuper: boolean; onCreated: (c
     setBusy(true);
     setError(null);
     try {
-      const res = await api<{ user: User; temporaryPassword: string }>("/users/staff", {
+      const res = await api<CredentialResponse>("/users/staff", {
         method: "POST",
         body: {
           name: form.get("name"),
@@ -280,7 +297,15 @@ function AddDispatcher({ isSuper, onCreated }: { isSuper: boolean; onCreated: (c
           ...(isSuper && { state: form.get("state"), country: form.get("country") || "India" }),
         },
       });
-      onCreated({ name: res.user.name, email: res.user.email, password: res.temporaryPassword, reason: "created" });
+      onCreated({
+        name: res.user.name,
+        email: res.user.email,
+        password: res.temporaryPassword,
+        reason: "created",
+        emailed: res.emailed,
+        emailError: res.emailError,
+        previewUrl: res.previewUrl,
+      });
       formEl.reset();
       setOpen(false);
     } catch (err) {
@@ -343,13 +368,26 @@ function CredentialCard({ credential, onDismiss }: { credential: Credential; onD
   const [copied, setCopied] = useState(false);
   const text = `UrbanOps sign-in\nEmail: ${credential.email}\nTemporary password: ${credential.password}\nYou'll be asked to choose your own password at first sign-in.`;
   return (
-    <div className="credential-card" role="status">
+    <div className={`credential-card ${credential.emailError ? "warn" : ""}`} role="status">
       <div>
         <strong>
           {credential.reason === "created" ? `Account created for ${credential.name}.` : `Password reset for ${credential.name}.`}
         </strong>{" "}
-        Give them these details. The password is shown only now.
+        {credential.emailed
+          ? `Sign-in details were emailed to ${credential.email}. They're also shown here in case you need to pass them on another way.`
+          : credential.emailError
+            ? `Could not email them (${credential.emailError}). Give them these details yourself.`
+            : "Give them these details. The password is shown only now."}
       </div>
+      {credential.previewUrl && (
+        <div className="small">
+          Development mode: the email wasn&apos;t delivered.{" "}
+          <a href={credential.previewUrl} target="_blank" rel="noreferrer">
+            Open the preview
+          </a>
+          .
+        </div>
+      )}
       <div className="credential-values mono">
         <span>Email: {credential.email}</span>
         <span>

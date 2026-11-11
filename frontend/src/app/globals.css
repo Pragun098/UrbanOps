@@ -1381,3 +1381,6 @@ button {
   .inline-fields { grid-template-columns: 1fr; }
   .inline-fields .wide { grid-column: auto; }
 }
+
+.credential-card.warn { border-color: var(--severity-medium); background: #FFF6E5; }
+.credential-card a { color: var(--accent-civic); font-weight: 600; }

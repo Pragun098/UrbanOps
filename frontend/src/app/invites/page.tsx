@@ -25,8 +25,17 @@ type Invite = {
   usedAt?: string | null;
   usedBy?: { name: string; email: string } | null;
   createdBy?: { name: string } | null;
+  sentTo?: string | null;
 };
 type RegionRow = { key: string; name: string; open: number; total: number; admins: number; dispatchers: number };
+type Created = {
+  code: string;
+  regionName: string;
+  expiresAt: string;
+  emailedTo?: string | null;
+  emailError?: string;
+  previewUrl?: string;
+};
 
 export default function InvitesPage() {
   return (
@@ -40,7 +49,7 @@ function Invites() {
   const [invites, setInvites] = useState<Invite[]>([]);
   const [regions, setRegions] = useState<RegionRow[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [created, setCreated] = useState<{ code: string; regionName: string; expiresAt: string } | null>(null);
+  const [created, setCreated] = useState<Created | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const reload = useCallback(() => setReloadKey((k) => k + 1), []);
 
@@ -73,23 +82,6 @@ function Invites() {
 
   return (
     <>
-      <section className="steps-explainer panel">
-        <ol>
-          <li>
-            <b>Create an invite</b> for a state below.
-          </li>
-          <li>
-            <b>Send the code</b> to that state&apos;s official (it&apos;s shown only once).
-          </li>
-          <li>
-            They choose <b>State admin invite</b> on the sign-in page and register: they become admin of that state only.
-          </li>
-          <li>
-            That admin adds their <b>dispatchers</b> from the Team page.
-          </li>
-        </ol>
-      </section>
-
       {error && <div className="alert error">{error}</div>}
 
       <CreateInvite
@@ -151,6 +143,7 @@ function Invites() {
               <th>Code</th>
               <th>State</th>
               <th>Status</th>
+              <th>Sent to</th>
               <th>Note</th>
               <th>Created</th>
               <th aria-label="Actions" />
@@ -159,7 +152,7 @@ function Invites() {
           <tbody>
             {invites.length === 0 && (
               <tr>
-                <td colSpan={6} className="empty-state">
+                <td colSpan={7} className="empty-state">
                   No invites yet.
                 </td>
               </tr>
@@ -178,6 +171,7 @@ function Invites() {
                         : ""}
                   </div>
                 </td>
+                <td className="mono small">{inv.sentTo || <span className="muted">by hand</span>}</td>
                 <td className="small">{inv.note || "–"}</td>
                 <td className="mono small">{timeAgo(inv.createdAt)}</td>
                 <td className="row-actions">
@@ -196,7 +190,7 @@ function Invites() {
   );
 }
 
-function CreateInvite({ onCreated }: { onCreated: (c: { code: string; regionName: string; expiresAt: string }) => void }) {
+function CreateInvite({ onCreated }: { onCreated: (c: Created) => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -204,19 +198,31 @@ function CreateInvite({ onCreated }: { onCreated: (c: { code: string; regionName
     event.preventDefault();
     const formEl = event.currentTarget;
     const form = new FormData(formEl);
+    const email = String(form.get("email") || "").trim();
     setBusy(true);
     setError(null);
     try {
-      const res = await api<{ code: string; invite: Invite }>("/invites", {
-        method: "POST",
-        body: {
-          state: form.get("state"),
-          country: form.get("country") || "India",
-          note: String(form.get("note") || "").trim() || undefined,
-          expiresInDays: Number(form.get("days")) || 7,
-        },
+      const res = await api<{ code: string; invite: Invite; emailed: boolean; emailError?: string; previewUrl?: string }>(
+        "/invites",
+        {
+          method: "POST",
+          body: {
+            state: form.get("state"),
+            country: form.get("country") || "India",
+            note: String(form.get("note") || "").trim() || undefined,
+            expiresInDays: Number(form.get("days")) || 7,
+            email: email || undefined,
+          },
+        }
+      );
+      onCreated({
+        code: res.code,
+        regionName: res.invite.regionName,
+        expiresAt: res.invite.expiresAt,
+        emailedTo: res.emailed ? email : null,
+        emailError: email && !res.emailed ? res.emailError || "Email could not be sent" : undefined,
+        previewUrl: res.previewUrl,
       });
-      onCreated({ code: res.code, regionName: res.invite.regionName, expiresAt: res.invite.expiresAt });
       formEl.reset();
     } catch (err) {
       setError(errorMessage(err));
@@ -253,25 +259,23 @@ function CreateInvite({ onCreated }: { onCreated: (c: { code: string; regionName
             </select>
           </label>
           <label className="form-group wide">
+            <span>Email the code to (optional)</span>
+            <input name="email" type="email" placeholder="official@tn.gov.in — leave empty to pass the code on yourself" />
+          </label>
+          <label className="form-group wide">
             <span>Note (who it&apos;s for)</span>
             <input name="note" maxLength={200} placeholder="e.g. TN Municipal Administration, Mr. Kumar" />
           </label>
         </div>
         <button type="submit" className="btn-small" disabled={busy}>
-          {busy ? "Creating…" : "Create invite code"}
+          {busy ? "Creating…" : "Create invite"}
         </button>
       </div>
     </form>
   );
 }
 
-function CodeCard({
-  created,
-  onDismiss,
-}: {
-  created: { code: string; regionName: string; expiresAt: string };
-  onDismiss: () => void;
-}) {
+function CodeCard({ created, onDismiss }: { created: Created; onDismiss: () => void }) {
   const [copied, setCopied] = useState(false);
   const message =
     `You've been invited to be the UrbanOps admin for ${created.regionName}.\n` +
@@ -279,10 +283,24 @@ function CodeCard({
     `2. Enter this code: ${created.code}\n` +
     `The code works once and expires on ${new Date(created.expiresAt).toLocaleDateString()}.`;
   return (
-    <div className="credential-card" role="status">
+    <div className={`credential-card ${created.emailError ? "warn" : ""}`} role="status">
       <div>
-        <strong>Invite created for {created.regionName}.</strong> Copy it now: it will not be shown again.
+        <strong>Invite created for {created.regionName}.</strong>{" "}
+        {created.emailedTo
+          ? `Emailed to ${created.emailedTo}. The code is also shown here in case you need to pass it on another way.`
+          : created.emailError
+            ? `Could not email it (${created.emailError}). Copy the code and send it yourself.`
+            : "Copy it now: it will not be shown again."}
       </div>
+      {created.previewUrl && (
+        <div className="small">
+          Development mode: the email wasn&apos;t delivered.{" "}
+          <a href={created.previewUrl} target="_blank" rel="noreferrer">
+            Open the preview
+          </a>{" "}
+          to see what the official would receive.
+        </div>
+      )}
       <div className="invite-code mono">{created.code}</div>
       <div className="credential-actions">
         <button type="button" className="btn-small" onClick={async () => setCopied(await copyText(message))}>

@@ -21,6 +21,7 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 const { isScopedRole } = require('../config/permissions');
 const { hashPassword } = require('../services/auth');
 const { makeRegion, isValidRegionKey } = require('../services/regions');
+const { sendMail, staffEmail } = require('../services/mailer');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -136,11 +137,21 @@ router.post('/staff', requireRole('admin', 'superadmin'), async (req, res, next)
       createdBy: req.user._id,
     });
 
+    const delivery = await sendMail({
+      to: user.email,
+      ...staffEmail({ name: user.name, temporaryPassword: password, regionName: region.name, createdBy: req.user.name }),
+    });
+
     return res.status(201).json({
       success: true,
       user,
       temporaryPassword: password, // shown once; only the hash is stored
-      message: 'Give these details to the dispatcher. They must set a new password at first sign-in.',
+      emailed: delivery.sent,
+      ...(delivery.error && { emailError: delivery.error }),
+      ...(delivery.previewUrl && { previewUrl: delivery.previewUrl }),
+      message: delivery.sent
+        ? `Sign-in details emailed to ${user.email}. They must set a new password at first sign-in.`
+        : 'Give these details to the dispatcher. They must set a new password at first sign-in.',
     });
   } catch (err) {
     if (err.code === 11000) return bad(res, 'An account with this email already exists', 409);
@@ -180,7 +191,19 @@ router.post('/:id/reset-password', requireRole('admin', 'superadmin'), async (re
     target.passwordHash = await hashPassword(password);
     target.mustChangePassword = true;
     await target.save();
-    return res.json({ success: true, user: target, temporaryPassword: password });
+
+    const delivery = await sendMail({
+      to: target.email,
+      ...staffEmail({ name: target.name, temporaryPassword: password, regionName: target.regionName, createdBy: req.user.name, reason: 'reset' }),
+    });
+    return res.json({
+      success: true,
+      user: target,
+      temporaryPassword: password,
+      emailed: delivery.sent,
+      ...(delivery.error && { emailError: delivery.error }),
+      ...(delivery.previewUrl && { previewUrl: delivery.previewUrl }),
+    });
   } catch (err) {
     return next(err);
   }

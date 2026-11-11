@@ -32,6 +32,19 @@ export default function LoginPage() {
   const [mode, setMode] = useState<Mode>("login");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [prefillCode, setPrefillCode] = useState("");
+
+  // Invite emails link here as /login?invite=ADM-...: open the invite tab with the code filled in.
+  // Deferred a tick so hydration first renders the same "Sign in" tab the server did.
+  useEffect(() => {
+    const code = new URLSearchParams(window.location.search).get("invite");
+    if (!code) return undefined;
+    const timer = setTimeout(() => {
+      setPrefillCode(code.trim().toUpperCase());
+      setMode("invite");
+    }, 0);
+    return () => clearTimeout(timer);
+  }, []);
 
   // Already signed in → go to the right home page.
   useEffect(() => {
@@ -113,7 +126,9 @@ export default function LoginPage() {
                 spellCheck={false}
                 placeholder="ADM-XXXX-XXXX-XXXX"
                 className="code-input"
+                defaultValue={prefillCode}
               />
+              {prefillCode && <span className="field-hint">Code filled in from your invitation link.</span>}
             </div>
           )}
 
@@ -155,12 +170,6 @@ export default function LoginPage() {
           )}
         </form>
 
-        {process.env.NODE_ENV !== "production" && (
-          <div className="dev-hint mono">
-            Dev accounts (npm run seed): superadmin@urbanops.local / super12345 · admin@urbanops.local / admin12345
-            (Karnataka) · dispatcher@urbanops.local / dispatch12345 (Karnataka)
-          </div>
-        )}
       </div>
     </main>
   );

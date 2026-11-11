@@ -15,13 +15,16 @@ const User = require('../models/User');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { createInvite } = require('../services/invites');
 const { makeRegion } = require('../services/regions');
+const { sendMail, inviteEmail } = require('../services/mailer');
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const router = express.Router();
 router.use(requireAuth, requireRole('superadmin'));
 
 router.post('/', async (req, res, next) => {
   try {
-    const { state, country = 'India', note } = req.body || {};
+    const { state, country = 'India', note, email } = req.body || {};
     const region = makeRegion(state, country);
     if (region.key === 'unassigned') {
       return res.status(400).json({ success: false, error: 'state and country are required' });
@@ -29,6 +32,10 @@ router.post('/', async (req, res, next) => {
     const days = Math.min(30, Math.max(1, parseInt(req.body?.expiresInDays, 10) || 7));
     if (note !== undefined && (typeof note !== 'string' || note.length > 200)) {
       return res.status(400).json({ success: false, error: 'note must be a string of at most 200 characters' });
+    }
+    const to = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    if (to && !EMAIL_RE.test(to)) {
+      return res.status(400).json({ success: false, error: 'email is not a valid address' });
     }
 
     const { invite, code } = await createInvite({
@@ -38,11 +45,36 @@ router.post('/', async (req, res, next) => {
       createdBy: req.user._id,
       expiresInDays: days,
     });
+
+    // Optionally email the code. A send failure is reported, not fatal: the code is
+    // still returned so the superadmin can pass it on by hand.
+    let delivery = null;
+    if (to) {
+      const message = inviteEmail({
+        code,
+        regionName: region.name,
+        expiresAt: invite.expiresAt,
+        note: invite.note,
+        invitedBy: req.user.name,
+      });
+      delivery = await sendMail({ to, ...message });
+      if (delivery.sent) {
+        invite.sentTo = to;
+        invite.sentAt = new Date();
+        await invite.save();
+      }
+    }
+
     return res.status(201).json({
       success: true,
       invite,
       code,
-      message: `Send this code to the ${region.name} official. It works once and expires in ${days} day(s).`,
+      emailed: !!delivery?.sent,
+      ...(delivery && !delivery.sent && { emailError: delivery.error }),
+      ...(delivery?.previewUrl && { previewUrl: delivery.previewUrl }),
+      message: delivery?.sent
+        ? `Invite emailed to ${to}. It works once and expires in ${days} day(s).`
+        : `Send this code to the ${region.name} official. It works once and expires in ${days} day(s).`,
     });
   } catch (err) {
     return next(err);

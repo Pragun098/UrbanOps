@@ -6,10 +6,11 @@ const assert = require('node:assert/strict');
 const request = require('supertest');
 const jwt = require('jsonwebtoken');
 
-const { connectTestDb, clearTestDb, dropTestDb } = require('./_db');
+const { connectTestDb, clearTestDb, dropTestDb, sentMails, failMail } = require('./_db');
 const app = require('../app');
 const User = require('../models/User');
 const Invite = require('../models/Invite');
+const { inviteEmail } = require('../services/mailer');
 const { hashPassword, signToken, getJwtSecret } = require('../services/auth');
 
 before(connectTestDb);
@@ -187,6 +188,11 @@ describe('staff management by state', () => {
     assert.equal(res.body.user.role, 'dispatcher');
     assert.equal(res.body.user.region, 'india/karnataka', 'admins can only staff their own state');
     assert.match(res.body.temporaryPassword, /^[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/);
+    assert.equal(res.body.emailed, true, 'temporary password is emailed to the dispatcher');
+    const mail = sentMails[sentMails.length - 1];
+    assert.equal(mail.to, 'new@city.gov');
+    assert.ok(mail.text.includes(res.body.temporaryPassword));
+    assert.ok(mail.text.includes('Karnataka, India'));
 
     const stored = await User.findOne({ email: 'new@city.gov' }).select('+passwordHash');
     assert.equal(stored.mustChangePassword, true);
@@ -347,5 +353,80 @@ describe('admin invites (state admins)', () => {
     assert.equal(res.status, 201);
     assert.equal(res.body.user.role, 'citizen');
     assert.equal(res.body.user.region, null);
+  });
+});
+
+describe('emailing invite codes', () => {
+  const as = (token) => ({ Authorization: `Bearer ${token}` });
+
+  beforeEach(() => {
+    sentMails.length = 0;
+    failMail.on = false;
+  });
+
+  test('with an email address the code is sent, with a link that pre-fills it', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    const res = await request(app)
+      .post('/api/v1/invites')
+      .set(as(sa))
+      .send({ state: 'Kerala', email: 'Official@Kerala.gov.in', note: 'Kerala PWD' });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.emailed, true);
+    assert.match(res.body.message, /emailed to official@kerala.gov.in/i);
+
+    assert.equal(sentMails.length, 1);
+    const mail = sentMails[0];
+    assert.equal(mail.to, 'official@kerala.gov.in');
+    assert.match(mail.subject, /Kerala, India/);
+    assert.ok(mail.text.includes(res.body.code), 'plain-text body carries the code');
+    assert.ok(mail.html.includes(res.body.code), 'html body carries the code');
+    assert.ok(mail.text.includes(`/login?invite=${encodeURIComponent(res.body.code)}`), 'link pre-fills the code');
+    assert.ok(mail.text.includes('superadmin'), 'says who invited them');
+
+    const list = await request(app).get('/api/v1/invites').set(as(sa));
+    assert.equal(list.body.data[0].sentTo, 'official@kerala.gov.in');
+    assert.ok(list.body.data[0].sentAt);
+
+    // The emailed code works exactly like a hand-delivered one.
+    const reg = await request(app).post('/api/v1/auth/register-admin')
+      .send({ code: res.body.code, name: 'K', email: 'official@kerala.gov.in', password: 'password123' });
+    assert.equal(reg.status, 201);
+    assert.equal(reg.body.user.region, 'india/kerala');
+  });
+
+  test('without an email nothing is sent and the code is returned for hand delivery', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    const res = await request(app).post('/api/v1/invites').set(as(sa)).send({ state: 'Goa' });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.emailed, false);
+    assert.equal(sentMails.length, 0);
+    assert.ok(res.body.code);
+  });
+
+  test('an invalid email is rejected before any invite is created', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    const res = await request(app).post('/api/v1/invites').set(as(sa)).send({ state: 'Goa', email: 'not-an-email' });
+    assert.equal(res.status, 400);
+    assert.equal(await Invite.countDocuments(), 0);
+    assert.equal(sentMails.length, 0);
+  });
+
+  test('if the mail server is down the invite still exists and the code is returned', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    failMail.on = true;
+    const res = await request(app).post('/api/v1/invites').set(as(sa)).send({ state: 'Goa', email: 'x@goa.gov.in' });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.emailed, false);
+    assert.match(res.body.emailError, /SMTP down/);
+    assert.ok(res.body.code, 'superadmin can still pass the code on by hand');
+    const list = await request(app).get('/api/v1/invites').set(as(sa));
+    assert.equal(list.body.data[0].sentTo, null, 'not recorded as sent');
+  });
+
+  test('html email escapes user-supplied text', () => {
+    const { html } = inviteEmail({ code: 'ADM-TEST-TEST-TEST', regionName: 'X<script>alert(1)</script>', expiresAt: new Date(), note: '<b>n</b>', invitedBy: 'A&B' });
+    assert.ok(!html.includes('<script>'));
+    assert.ok(html.includes('&lt;script&gt;'));
+    assert.ok(html.includes('A&amp;B'));
   });
 });

@@ -7,6 +7,18 @@ process.env.NODE_ENV = process.env.NODE_ENV || 'test';
 
 const mongoose = require('mongoose');
 const { setResolver } = require('../services/regions');
+const { setTransport } = require('../services/mailer');
+
+// Capture outgoing email in memory (never hits SMTP or Ethereal in tests).
+const sentMails = [];
+const failMail = { on: false };
+setTransport({
+  sendMail: async (mail) => {
+    if (failMail.on) throw new Error('SMTP down (simulated)');
+    sentMails.push(mail);
+    return { messageId: `test-${sentMails.length}` };
+  },
+});
 
 // Deterministic, offline region lookup for tests (never calls Nominatim).
 const KARNATAKA = { key: 'india/karnataka', name: 'Karnataka, India' };
@@ -36,4 +48,4 @@ const dropTestDb = async () => {
   }
 };
 
-module.exports = { connectTestDb, clearTestDb, dropTestDb, TEST_URI, KARNATAKA, MAHARASHTRA };
+module.exports = { connectTestDb, clearTestDb, dropTestDb, TEST_URI, KARNATAKA, MAHARASHTRA, sentMails, failMail };

@@ -19,6 +19,9 @@ const InviteSchema = new Schema(
     region: { type: String, required: true },
     regionName: { type: String, required: true },
     note: { type: String, trim: true, maxlength: 200 },
+    // Where the code was emailed, if it was.
+    sentTo: { type: String, lowercase: true, trim: true, default: null },
+    sentAt: { type: Date, default: null },
     createdBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     expiresAt: { type: Date, required: true },
     usedAt: { type: Date, default: null },
