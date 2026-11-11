@@ -12,6 +12,7 @@ const telemetryRoutes = require('./routes/telemetry');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const issueRoutes = require('./routes/issues');
+const inviteRoutes = require('./routes/invites');
 
 const app = express();
 
@@ -48,6 +49,7 @@ app.use('/api/v1', (req, res, next) => {
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/issues', issueRoutes);
+app.use('/api/v1/invites', inviteRoutes);
 app.use('/api/v1/telemetry', telemetryRoutes);
 
 app.use((req, res) => {

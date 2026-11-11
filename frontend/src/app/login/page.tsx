@@ -5,10 +5,29 @@ import { useRouter } from "next/navigation";
 import { errorMessage } from "@/lib/api";
 import { homeFor, useAuth } from "@/lib/auth";
 
-type Mode = "login" | "register";
+type Mode = "login" | "register" | "invite";
+
+const COPY: Record<Mode, { title: string; blurb: string; submit: string }> = {
+  login: {
+    title: "Sign in",
+    blurb: "Citizens report and track issues. State dispatchers and admins see their state's live command center.",
+    submit: "Sign in",
+  },
+  register: {
+    title: "Create a citizen account",
+    blurb: "Report potholes, leaks and hazards anywhere, and follow their progress until they're fixed.",
+    submit: "Create account",
+  },
+  invite: {
+    title: "Register as a state admin",
+    blurb:
+      "Enter the invite code you received from the UrbanOps platform team. It makes you the admin of the state it was issued for. Codes work once and expire.",
+    submit: "Create admin account",
+  },
+};
 
 export default function LoginPage() {
-  const { status, user, login, register } = useAuth();
+  const { status, user, login, register, registerAdmin } = useAuth();
   const router = useRouter();
   const [mode, setMode] = useState<Mode>("login");
   const [error, setError] = useState<string | null>(null);
@@ -16,20 +35,30 @@ export default function LoginPage() {
 
   // Already signed in → go to the right home page.
   useEffect(() => {
-    if (status === "authenticated" && user) router.replace(homeFor(user.role));
+    if (status === "authenticated" && user) router.replace(homeFor(user.role, user.mustChangePassword));
   }, [status, user, router]);
+
+  const switchMode = (next: Mode) => {
+    setMode(next);
+    setError(null);
+  };
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const email = String(form.get("email") || "");
     const password = String(form.get("password") || "");
+    const name = String(form.get("name") || "");
     setBusy(true);
     setError(null);
     try {
       const signedIn =
-        mode === "login" ? await login(email, password) : await register(String(form.get("name") || ""), email, password);
-      router.replace(homeFor(signedIn.role));
+        mode === "login"
+          ? await login(email, password)
+          : mode === "register"
+            ? await register(name, email, password)
+            : await registerAdmin(String(form.get("code") || ""), name, email, password);
+      router.replace(homeFor(signedIn.role, signedIn.mustChangePassword));
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -37,32 +66,58 @@ export default function LoginPage() {
     }
   }
 
+  const copy = COPY[mode];
+
   return (
     <main className="report-page">
       <div className="report-container auth-container">
         <div className="report-header">
           <p className="eyebrow">URBANOPS COMMAND CENTER</p>
-          <h1>{mode === "login" ? "Sign in" : "Create a citizen account"}</h1>
-          <p>
-            {mode === "login"
-              ? "Dispatchers and admins see the live command center. Citizens can report issues and track them."
-              : "Report potholes, leaks and hazards, and follow their progress until they're fixed."}
-          </p>
+          <h1>{copy.title}</h1>
+          <p>{copy.blurb}</p>
         </div>
 
         <div className="tabs" role="tablist">
-          <button type="button" role="tab" aria-selected={mode === "login"} className={mode === "login" ? "tab active" : "tab"} onClick={() => { setMode("login"); setError(null); }}>
-            Sign in
-          </button>
-          <button type="button" role="tab" aria-selected={mode === "register"} className={mode === "register" ? "tab active" : "tab"} onClick={() => { setMode("register"); setError(null); }}>
-            Register
-          </button>
+          {(
+            [
+              ["login", "Sign in"],
+              ["register", "Citizen sign-up"],
+              ["invite", "State admin invite"],
+            ] as const
+          ).map(([m, label]) => (
+            <button
+              key={m}
+              type="button"
+              role="tab"
+              aria-selected={mode === m}
+              className={mode === m ? "tab active" : "tab"}
+              onClick={() => switchMode(m)}
+            >
+              {label}
+            </button>
+          ))}
         </div>
 
-        <form className="report-form" onSubmit={handleSubmit}>
+        <form className="report-form" onSubmit={handleSubmit} key={mode}>
           {error && <div className="alert error">{error}</div>}
 
-          {mode === "register" && (
+          {mode === "invite" && (
+            <div className="form-group">
+              <label htmlFor="code">Invite code</label>
+              <input
+                id="code"
+                name="code"
+                type="text"
+                required
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="ADM-XXXX-XXXX-XXXX"
+                className="code-input"
+              />
+            </div>
+          )}
+
+          {mode !== "login" && (
             <div className="form-group">
               <label htmlFor="name">Full name</label>
               <input id="name" name="name" type="text" autoComplete="name" required maxLength={100} />
@@ -70,7 +125,7 @@ export default function LoginPage() {
           )}
 
           <div className="form-group">
-            <label htmlFor="email">Email</label>
+            <label htmlFor="email">{mode === "invite" ? "Official email" : "Email"}</label>
             <input id="email" name="email" type="email" autoComplete="email" required />
           </div>
 
@@ -81,21 +136,29 @@ export default function LoginPage() {
               name="password"
               type="password"
               autoComplete={mode === "login" ? "current-password" : "new-password"}
-              minLength={mode === "register" ? 8 : undefined}
+              minLength={mode === "login" ? undefined : 8}
               maxLength={72}
               required
             />
-            {mode === "register" && <span className="field-hint">At least 8 characters.</span>}
+            {mode !== "login" && <span className="field-hint">At least 8 characters.</span>}
           </div>
 
           <button type="submit" className="submit-button" disabled={busy}>
-            {busy ? "Please wait…" : mode === "login" ? "Sign in" : "Create account"}
+            {busy ? "Please wait…" : copy.submit}
           </button>
+
+          {mode === "login" && (
+            <p className="field-hint auth-footnote">
+              Dispatchers: your state admin creates your account and gives you a temporary password. You&apos;ll set your
+              own at first sign-in.
+            </p>
+          )}
         </form>
 
         {process.env.NODE_ENV !== "production" && (
           <div className="dev-hint mono">
-            Dev accounts (npm run seed): dispatcher@urbanops.local / dispatch12345 · admin@urbanops.local / admin12345
+            Dev accounts (npm run seed): superadmin@urbanops.local / super12345 · admin@urbanops.local / admin12345
+            (Karnataka) · dispatcher@urbanops.local / dispatch12345 (Karnataka)
           </div>
         )}
       </div>

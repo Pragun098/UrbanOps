@@ -38,10 +38,20 @@ const authenticate = async (req) => {
   return { user, error: null };
 };
 
+// Accounts created with a temporary password may only do this until they change it.
+const ALLOWED_BEFORE_PASSWORD_CHANGE = ['/api/v1/auth/me', '/api/v1/auth/change-password'];
+
 const requireAuth = async (req, res, next) => {
   try {
     const { user, error } = await authenticate(req);
     if (!user) return unauthorized(res, error || undefined);
+    if (user.mustChangePassword && !ALLOWED_BEFORE_PASSWORD_CHANGE.includes(req.originalUrl.split('?')[0])) {
+      return res.status(403).json({
+        success: false,
+        code: 'PASSWORD_CHANGE_REQUIRED',
+        error: 'Please set a new password before continuing',
+      });
+    }
     req.user = user;
     return next();
   } catch (err) {

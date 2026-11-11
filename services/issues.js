@@ -15,6 +15,14 @@ const {
 const { computeSeverity, severityExpression } = require('./severity');
 const { issueEvents } = require('./events');
 const { withLock } = require('./keyedMutex');
+const {
+  TRANSITIONS_BY_ROLE,
+  allowedTransitions,
+  canTransition,
+  anyRoleCanTransition,
+  inJurisdiction,
+} = require('../config/permissions');
+const { resolveRegion, UNASSIGNED } = require('./regions');
 
 class ServiceError extends Error {
   constructor(status, message, details) {
@@ -106,9 +114,14 @@ const mergeReportInto = async (issueId, { reporterId, category, images = [], now
  *
  * @returns {Promise<{ issue: object, merged: boolean, alreadyReported: boolean }>}
  */
-const submitReport = (input) => withLock(`report:${input.category}`, () => submitReportUnlocked(input));
+const submitReport = async (input) => {
+  // Resolve the state OUTSIDE the lock: it may be a (cached, rate-limited) network call.
+  const [lng, lat] = input.coordinates;
+  const region = await resolveRegion(lat, lng);
+  return withLock(`report:${input.category}`, () => submitReportUnlocked({ ...input, region }));
+};
 
-const submitReportUnlocked = async ({ category, subcategory, description, address, coordinates, reporterId, images = [] }) => {
+const submitReportUnlocked = async ({ category, subcategory, description, address, coordinates, reporterId, images = [], region }) => {
   const now = new Date();
 
   // 1. Fast path: merge into an existing issue.
@@ -134,6 +147,8 @@ const submitReportUnlocked = async ({ category, subcategory, description, addres
     location: { type: 'Point', coordinates },
     reporterIds: [reporterId],
     lastReportedAt: now,
+    region: region?.key || UNASSIGNED.key,
+    regionName: region?.name || UNASSIGNED.name,
   });
 
   // 3. Reconcile with any concurrent insert: oldest issue wins.
@@ -152,54 +167,85 @@ const submitReportUnlocked = async ({ category, subcategory, description, addres
   return { issue, merged: false, alreadyReported: false };
 };
 
-// Kanban transitions (PRD §6.4). Forward moves plus one-step undo / reopen.
-const ALLOWED_TRANSITIONS = Object.freeze({
-  open: ['dispatched', 'resolved'],
-  dispatched: ['resolved', 'open'],
-  resolved: ['open'],
-});
+// Every transition any role may perform (PRD §6.4). Per-role limits live in
+// config/permissions.js.
+const ALLOWED_TRANSITIONS = TRANSITIONS_BY_ROLE.admin;
+
+const HISTORY_LIMIT = 50;
 
 /**
- * Change status and/or assignee. Uses a conditional update on the status we
- * validated against, so two dispatchers moving the same card can't both win.
+ * Change status and/or assignee on behalf of `actor` ({ _id, name, role }).
+ *  - 400: transition never allowed (e.g. resolved → dispatched)
+ *  - 403: transition exists but not for this role (e.g. dispatcher reopening)
+ *  - 409: someone else changed the status first
+ * Every change is appended to the issue's history (who / what / when).
  */
-const updateIssue = async (issueId, { status, assignedTo }) => {
+const updateIssue = async (issueId, { status, assignedTo }, actor) => {
   if (!mongoose.isValidObjectId(issueId)) throw new ServiceError(400, 'Invalid issue id');
+  if (!actor) throw new ServiceError(401, 'Authentication required');
   if (status === undefined && assignedTo === undefined) {
     throw new ServiceError(400, 'Provide status and/or assignedTo');
   }
 
-  const current = await Issue.findById(issueId).select('status').lean();
-  if (!current) throw new ServiceError(404, 'Issue not found');
+  const current = await Issue.findById(issueId).select('status assignedTo region').lean();
+  // Outside your state looks the same as not existing: don't leak other states' issues.
+  if (!current || !inJurisdiction(actor, current.region)) throw new ServiceError(404, 'Issue not found');
 
-  const set = { updatedAt: new Date() };
+  const now = new Date();
+  const set = { updatedAt: now };
   const reasons = [];
+  const history = [];
+  const by = { by: actor._id, byName: actor.name, byRole: actor.role, at: now };
 
   if (status !== undefined && status !== current.status) {
-    const allowed = ALLOWED_TRANSITIONS[current.status] || [];
-    if (!allowed.includes(status)) {
-      throw new ServiceError(400, `Cannot move issue from ${current.status} to ${status}`, { allowed });
+    if (!anyRoleCanTransition(current.status, status)) {
+      throw new ServiceError(400, `Cannot move issue from ${current.status} to ${status}`, {
+        allowed: allowedTransitions(actor.role, current.status),
+      });
+    }
+    if (!canTransition(actor.role, current.status, status)) {
+      throw new ServiceError(403, `A ${actor.role} cannot move an issue from ${current.status} to ${status}`, {
+        allowed: allowedTransitions(actor.role, current.status),
+      });
     }
     set.status = status;
-    set.resolvedAt = status === 'resolved' ? new Date() : null;
+    set.resolvedAt = status === 'resolved' ? now : null;
     reasons.push('status');
+    history.push({ action: 'status', from: current.status, to: status, ...by });
   }
 
   if (assignedTo !== undefined) {
     if (assignedTo === null || assignedTo === '') {
       set.assignedTo = null;
+      history.push({ action: 'assignment', from: current.assignedTo ? String(current.assignedTo) : null, to: null, toName: null, ...by });
     } else {
       if (!mongoose.isValidObjectId(assignedTo)) throw new ServiceError(400, 'Invalid assignedTo id');
-      const assignee = await User.exists({ _id: assignedTo, role: { $in: ['dispatcher', 'admin'] } });
-      if (!assignee) throw new ServiceError(400, 'assignedTo must be a dispatcher or admin');
+      // Assignee must be staff of THIS issue's state (or a superadmin).
+      const assignee = await User.findOne({
+        _id: assignedTo,
+        $or: [{ role: { $in: ['dispatcher', 'admin'] }, region: current.region }, { role: 'superadmin' }],
+      })
+        .select('name')
+        .lean();
+      if (!assignee) throw new ServiceError(400, 'assignedTo must be a dispatcher or admin of this state');
       set.assignedTo = assignedTo;
+      history.push({
+        action: 'assignment',
+        from: current.assignedTo ? String(current.assignedTo) : null,
+        to: String(assignee._id),
+        toName: assignee.name,
+        ...by,
+      });
     }
     reasons.push('assignment');
   }
 
+  const update = { $set: set };
+  if (history.length) update.$push = { history: { $each: history, $slice: -HISTORY_LIMIT } };
+
   const updated = await Issue.findOneAndUpdate(
     { _id: issueId, status: current.status },
-    { $set: set },
+    update,
     { new: true, runValidators: true }
   )
     .populate('assignedTo', 'name email role')

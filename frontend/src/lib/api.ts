@@ -5,7 +5,7 @@
 
 export const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000").replace(/\/$/, "");
 
-export type Role = "citizen" | "dispatcher" | "admin";
+export type Role = "citizen" | "dispatcher" | "admin" | "superadmin";
 export type IssueStatus = "open" | "dispatched" | "resolved";
 export type IssueCategory = "hazard" | "infra" | "minor";
 
@@ -15,9 +15,36 @@ export type User = {
   email: string;
   role: Role;
   ward?: string;
+  /** State this staff member works in, e.g. "india/karnataka" (null for citizens/superadmin). */
+  region?: string | null;
+  regionName?: string | null;
+  mustChangePassword?: boolean;
 };
 
 export type StaffRef = { _id: string; name: string; email: string; role: Role };
+
+/** Sent by the API at login and /auth/me. The API enforces the same rules. */
+export type Permissions = {
+  transitions: Partial<Record<IssueStatus, IssueStatus[]>>;
+  canViewAllIssues: boolean;
+  /** admin (own state) and superadmin */
+  canManageStaff: boolean;
+  /** superadmin only */
+  canInviteAdmins: boolean;
+  /** superadmin sees every state */
+  allRegions: boolean;
+};
+
+export type HistoryEntry = {
+  action: "status" | "assignment";
+  from: string | null;
+  to: string | null;
+  toName?: string | null;
+  by: string;
+  byName?: string;
+  byRole?: Role;
+  at: string;
+};
 
 export type Issue = {
   _id: string;
@@ -38,6 +65,9 @@ export type Issue = {
   assignedTo?: StaffRef | null;
   reporterIds?: unknown[];
   reportedByMe?: boolean;
+  history?: HistoryEntry[];
+  region?: string;
+  regionName?: string;
 };
 
 export type Paged<T> = { success: true; data: T[]; page: number; limit: number; total: number };

@@ -38,6 +38,20 @@ const ImageSchema = new Schema(
   { _id: false }
 );
 
+const HistorySchema = new Schema(
+  {
+    action: { type: String, enum: ['status', 'assignment'], required: true },
+    from: { type: String, default: null },
+    to: { type: String, default: null },
+    toName: { type: String, default: null }, // assignee name, for assignment entries
+    by: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    byName: { type: String },
+    byRole: { type: String },
+    at: { type: Date, default: Date.now },
+  },
+  { _id: false }
+);
+
 const IssueSchema = new Schema(
   {
     category: { type: String, enum: ISSUE_CATEGORIES, required: true },
@@ -54,12 +68,18 @@ const IssueSchema = new Schema(
     severityScore: { type: Number, default: 0 },
     assignedTo: { type: Schema.Types.ObjectId, ref: 'User', default: null },
     resolvedAt: { type: Date, default: null },
+    // Jurisdiction, resolved from the location at report time (services/regions.js).
+    region: { type: String, default: 'unassigned' },
+    regionName: { type: String, default: 'Unassigned' },
+    // Audit trail of staff actions, newest last (capped in services/issues.js).
+    history: { type: [HistorySchema], default: [] },
   },
   { timestamps: true }
 );
 
 IssueSchema.index({ location: '2dsphere' });
 IssueSchema.index({ status: 1, severityScore: -1 });
+IssueSchema.index({ region: 1, status: 1, severityScore: -1 }); // state-scoped queues
 IssueSchema.index({ status: 1, createdAt: -1 }); // ?sort=recent
 IssueSchema.index({ reporterIds: 1, updatedAt: -1 }); // GET /issues/mine
 

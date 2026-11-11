@@ -10,25 +10,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import AppShell from "@/components/AppShell";
 import { ApiError, api, errorMessage, type Issue, type IssueStatus, type Paged, type StaffRef } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { COVERAGE_BBOX, useIssueStream, type IssueEvent } from "@/lib/socket";
+import { useIssueStream, type IssueEvent } from "@/lib/socket";
 import { STATUS_LABEL, issuePlace, issueRef, issueTitle, priorityOf, timeAgo } from "@/lib/format";
+import { ACTION_LABEL, allowedMoves, moveBody, moveDenial } from "@/lib/issues";
 
 const COLUMNS: IssueStatus[] = ["open", "dispatched", "resolved"];
-
-// Mirrors the backend's ALLOWED_TRANSITIONS.
-const TRANSITIONS: Record<IssueStatus, IssueStatus[]> = {
-  open: ["dispatched", "resolved"],
-  dispatched: ["resolved", "open"],
-  resolved: ["open"],
-};
-
-const ACTION_LABEL: Record<string, string> = {
-  "open>dispatched": "Dispatch →",
-  "open>resolved": "Close",
-  "dispatched>resolved": "Resolve ✓",
-  "dispatched>open": "← Back to open",
-  "resolved>open": "Reopen",
-};
 
 const RESOLVED_SHOWN = 30;
 
@@ -43,14 +29,14 @@ async function fetchBoard(signal?: AbortSignal) {
 
 export default function IncidentsPage() {
   return (
-    <AppShell title="Incidents" roles={["dispatcher", "admin"]}>
+    <AppShell title="Incidents" roles={["dispatcher", "admin", "superadmin"]}>
       <Board />
     </AppShell>
   );
 }
 
 function Board() {
-  const { token, user } = useAuth();
+  const { token, user, permissions } = useAuth();
   const [issues, setIssues] = useState<Issue[]>([]);
   const [staff, setStaff] = useState<StaffRef[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -78,7 +64,7 @@ function Board() {
   const handleEvent = useCallback((event: IssueEvent) => {
     setIssues((list) => [...list.filter((i) => i._id !== event.issue._id), event.issue]);
   }, []);
-  const live = useIssueStream(token, handleEvent, COVERAGE_BBOX);
+  const { connected: live } = useIssueStream(token, handleEvent);
 
   const columns = useMemo(() => {
     const byStatus: Record<IssueStatus, Issue[]> = { open: [], dispatched: [], resolved: [] };
@@ -107,20 +93,24 @@ function Board() {
 
   const move = (issue: Issue, status: IssueStatus) => {
     if (issue.status === status) return;
-    if (!TRANSITIONS[issue.status].includes(status)) {
-      setError(`Can't move from ${STATUS_LABEL[issue.status]} to ${STATUS_LABEL[status]}.`);
+    const denial = moveDenial(permissions, issue.status, status);
+    if (denial) {
+      setError(denial);
       return;
     }
-    // Dispatching an unassigned issue assigns it to whoever dispatched it.
-    const body: { status: IssueStatus; assignedTo?: string } = { status };
-    if (status === "dispatched" && !issue.assignedTo && user) body.assignedTo = user._id;
-    update(issue, body);
+    update(issue, moveBody(issue, status, user?._id));
   };
 
   return (
     <>
       <div className="board-toolbar">
-        <span className="mono muted">Drag cards between columns, or use the buttons. Highest severity first.</span>
+        <span className="mono muted">
+          {user?.role === "superadmin"
+            ? "Superadmin: all states. You can dispatch, resolve, close without dispatch, and reopen anywhere."
+            : user?.role === "admin"
+              ? `${user.regionName}: you can dispatch, resolve, close without dispatch, and reopen.`
+              : `${user?.regionName ?? "Your state"}: you can dispatch, assign, undo a dispatch, and resolve. Closing without dispatch and reopening need your state admin.`}
+        </span>
         <span className={`live-badge ${live ? "on" : ""}`}>
           <span className="live-dot" /> {live ? "LIVE" : "OFFLINE"}
         </span>
@@ -193,7 +183,7 @@ function Board() {
                     )}
 
                     <div className="card-actions">
-                      {TRANSITIONS[status].map((to) => (
+                      {allowedMoves(permissions, status).map((to) => (
                         <button
                           key={to}
                           type="button"

@@ -47,7 +47,7 @@ function MyReports() {
     setChanged(event.issue._id);
     setTimeout(() => setChanged(null), 2500);
   }, []);
-  const live = useIssueStream(token, handleEvent);
+  const { connected: live } = useIssueStream(token, handleEvent);
 
   return (
     <>

@@ -12,6 +12,7 @@ import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "re
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { useEffect } from "react";
+import UserLocation, { type UserPosition } from "@/components/map/UserLocation";
 import type { Issue } from "@/lib/api";
 import { STATUS_LABEL, issuePlace, issueRef, issueTitle, priorityOf, timeAgo, type Priority } from "@/lib/format";
 
@@ -42,9 +43,14 @@ function ClickToPick({ onPick }: { onPick: (lat: number, lng: number) => void })
 
 function FlyTo({ target }: { target: { lat: number; lng: number } | null | undefined }) {
   const map = useMap();
+  // Key on rounded coordinates: GPS re-reports the same spot every few seconds and
+  // we must not keep yanking the map back while the user pans.
+  const key = target ? `${target.lat.toFixed(5)},${target.lng.toFixed(5)}` : "";
   useEffect(() => {
-    if (target) map.flyTo([target.lat, target.lng], Math.max(map.getZoom(), 16), { duration: 0.6 });
-  }, [map, target]);
+    if (!key) return;
+    const [lat, lng] = key.split(",").map(Number);
+    map.flyTo([lat, lng], Math.max(map.getZoom(), 16), { duration: 0.6 });
+  }, [map, key]);
   return null;
 }
 
@@ -53,11 +59,16 @@ type Props = {
   onPick?: (lat: number, lng: number) => void;
   picked?: { lat: number; lng: number } | null;
   showLegend?: boolean;
+  /** Centre on the user's position when it's first known (default: false = city overview). */
+  centerOnUser?: boolean;
+  onLocate?: (pos: UserPosition) => void;
 };
 
-export default function LiveMap({ issues, onPick, picked, showLegend = true }: Props) {
+export default function LiveMap({ issues, onPick, picked, showLegend = true, centerOnUser = false, onLocate }: Props) {
   return (
-    <div className="map-wrapper" style={{ position: "relative", width: "100%", height: "100%" }}>
+    // Height comes from CSS (.map-wrapper / .pick-map / .full-map); an inline 100%
+    // would collapse to 0 inside containers without an explicit height.
+    <div className="map-wrapper" style={{ position: "relative", width: "100%" }}>
       <MapContainer center={BENGALURU} zoom={13} scrollWheelZoom style={{ height: "100%", width: "100%" }}>
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -66,6 +77,7 @@ export default function LiveMap({ issues, onPick, picked, showLegend = true }: P
 
         {onPick && <ClickToPick onPick={onPick} />}
         <FlyTo target={picked} />
+        <UserLocation autoCenter={centerOnUser} onLocate={onLocate} />
 
         {picked && <Marker position={[picked.lat, picked.lng]} icon={pickIcon} />}
 

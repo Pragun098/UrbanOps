@@ -2,12 +2,12 @@
  * Issue routes
  *
  *   POST  /api/v1/issues            any logged-in user: submit a report (dedup + severity)
- *   GET   /api/v1/issues            any logged-in user: list/map. Staff see full records,
- *                                   citizens see a public view (no reporter/assignee data)
+ *   GET   /api/v1/issues            staff: list/map of all issues (citizens: 403)
  *   GET   /api/v1/issues/mine       issues the caller reported
  *   GET   /api/v1/issues/stats      staff: dashboard analytics
  *   GET   /api/v1/issues/:id        staff, or a citizen who reported it
- *   PATCH /api/v1/issues/:id        staff: { status?, assignedTo? }
+ *   PATCH /api/v1/issues/:id        staff: { status?, assignedTo? }; allowed status moves
+ *                                   depend on role (config/permissions.js)
  */
 
 const express = require('express');
@@ -15,7 +15,8 @@ const mongoose = require('mongoose');
 const { rateLimit } = require('express-rate-limit');
 
 const Issue = require('../models/Issue');
-const { ISSUE_STATUSES, ISSUE_CATEGORIES } = require('../config/constants');
+const { ISSUE_STATUSES, ISSUE_CATEGORIES, STAFF_ROLES } = require('../config/constants');
+const { regionScope, inJurisdiction, JurisdictionError } = require('../config/permissions');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const {
   ServiceError,
@@ -28,11 +29,11 @@ const {
 const router = express.Router();
 router.use(requireAuth);
 
-const STAFF = ['dispatcher', 'admin'];
+const STAFF = STAFF_ROLES;
 const isStaff = (user) => STAFF.includes(user.role);
 
 const PUBLIC_FIELDS =
-  'category subcategory description address location geohash status duplicateCount lastReportedAt severityScore createdAt updatedAt resolvedAt';
+  'category subcategory description address location geohash status duplicateCount lastReportedAt severityScore createdAt updatedAt resolvedAt regionName';
 
 /** Strip fields citizens shouldn't see (other reporters' ids, staff assignments). */
 const toView = (issue, user) => {
@@ -42,6 +43,7 @@ const toView = (issue, user) => {
     const mine = (issue.reporterIds || []).some((id) => String(id) === String(user._id));
     delete view.reporterIds;
     delete view.assignedTo;
+    delete view.history;
     if (mine) view.reportedByMe = true;
   }
   return view;
@@ -50,6 +52,9 @@ const toView = (issue, user) => {
 const sendError = (res, err, next) => {
   if (err instanceof ServiceError) {
     return res.status(err.status).json({ success: false, error: err.message, ...(err.details && { details: err.details }) });
+  }
+  if (err instanceof JurisdictionError) {
+    return res.status(err.status).json({ success: false, error: err.message });
   }
   if (err.name === 'ValidationError' || err.name === 'CastError') {
     return res.status(400).json({ success: false, error: err.message });
@@ -131,10 +136,15 @@ router.post('/', reportLimiter, async (req, res, next) => {
 
 // ---------------------------------------------------------------- GET /
 
-router.get('/', async (req, res, next) => {
+// Citizens only see their own reports (/mine, /:id); the full list is for staff.
+router.get('/', requireRole(...STAFF), async (req, res, next) => {
   try {
     const { page, limit } = parsePaging(req.query, 500); // map views need more than one page of 20
-    const filter = {};
+    // Dispatchers/admins: own state only. Superadmin: all, optionally ?region=.
+    const filter = { ...regionScope(req.user) };
+    if (req.user.role === 'superadmin' && typeof req.query.region === 'string' && req.query.region) {
+      filter.region = req.query.region;
+    }
 
     const statuses = parseList(req.query.status, ISSUE_STATUSES, 'status') || ['open', 'dispatched'];
     filter.status = { $in: statuses };
@@ -143,6 +153,12 @@ router.get('/', async (req, res, next) => {
     if (categories) filter.category = { $in: categories };
 
     if (req.query.assignedTo === 'me') filter.assignedTo = req.user._id;
+
+    if (req.query.minSeverity !== undefined && req.query.minSeverity !== '') {
+      const min = Number(req.query.minSeverity);
+      if (!Number.isFinite(min) || min < 0) throw new ServiceError(400, 'minSeverity must be a non-negative number');
+      filter.severityScore = { $gte: min };
+    }
 
     // bbox=minLng,minLat,maxLng,maxLat → only issues inside the visible map area.
     if (req.query.bbox) {
@@ -168,7 +184,7 @@ router.get('/', async (req, res, next) => {
       .sort(sort)
       .skip((page - 1) * limit)
       .limit(limit);
-    query = staff ? query.populate('assignedTo', 'name email role') : query.select(`${PUBLIC_FIELDS} reporterIds`);
+    query = staff ? query.select('-history').populate('assignedTo', 'name email role') : query.select(`${PUBLIC_FIELDS} reporterIds`);
 
     const [docs, total] = await Promise.all([query.lean(), Issue.countDocuments(filter)]);
     const data = docs.map((d) => toView(d, req.user));
@@ -205,7 +221,12 @@ router.get('/stats', requireRole(...STAFF), async (req, res, next) => {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
 
+    const scope = { ...regionScope(req.user) };
+    if (req.user.role === 'superadmin' && typeof req.query.region === 'string' && req.query.region) {
+      scope.region = req.query.region;
+    }
     const [facets] = await Issue.aggregate([
+      { $match: scope },
       {
         $facet: {
           byStatus: [{ $group: { _id: '$status', count: { $sum: 1 } } }],
@@ -272,7 +293,9 @@ router.get('/:id', async (req, res, next) => {
 
     // 404 (not 403) for citizens asking about others' issues: don't confirm existence.
     const isReporter = issue?.reporterIds?.some((r) => String(r._id || r) === String(req.user._id));
-    if (!issue || (!staff && !isReporter)) throw new ServiceError(404, 'Issue not found');
+    // Staff outside their state, or citizens asking about others' issues: 404, don't confirm existence.
+    const canSee = issue && (staff ? inJurisdiction(req.user, issue.region) : isReporter);
+    if (!canSee) throw new ServiceError(404, 'Issue not found');
 
     return res.json({ success: true, issue: toView(issue, req.user) });
   } catch (err) {
@@ -288,7 +311,7 @@ router.patch('/:id', requireRole(...STAFF), async (req, res, next) => {
     if (status !== undefined && !ISSUE_STATUSES.includes(status)) {
       throw new ServiceError(400, `status must be one of ${ISSUE_STATUSES.join(', ')}`);
     }
-    const issue = await updateIssue(req.params.id, { status, assignedTo });
+    const issue = await updateIssue(req.params.id, { status, assignedTo }, req.user);
     return res.json({ success: true, issue: toView(issue, req.user) });
   } catch (err) {
     return sendError(res, err, next);

@@ -9,6 +9,7 @@ const jwt = require('jsonwebtoken');
 const { connectTestDb, clearTestDb, dropTestDb } = require('./_db');
 const app = require('../app');
 const User = require('../models/User');
+const Invite = require('../models/Invite');
 const { hashPassword, signToken, getJwtSecret } = require('../services/auth');
 
 before(connectTestDb);
@@ -18,8 +19,12 @@ after(dropTestDb);
 const register = (body) => request(app).post('/api/v1/auth/register').send(body);
 const login = (body) => request(app).post('/api/v1/auth/login').send(body);
 
-const makeUser = async (role, email = `${role}@city.gov`) => {
-  const user = await User.create({ name: role, email, passwordHash: await hashPassword('password123'), role });
+const scoped = (role) => role === 'dispatcher' || role === 'admin';
+const makeUser = async (role, email = `${role}@city.gov`, region = 'india/karnataka') => {
+  const user = await User.create({
+    name: role, email, passwordHash: await hashPassword('password123'), role,
+    ...(scoped(role) && { region, regionName: region === 'india/karnataka' ? 'Karnataka, India' : region }),
+  });
   return { user, token: signToken(user) };
 };
 
@@ -127,54 +132,220 @@ describe('requireAuth via /me', () => {
   });
 });
 
-describe('role-gated user management', () => {
-  test('citizens and dispatchers cannot list users; admins can', async () => {
+describe('staff management by state', () => {
+  const as = (token) => ({ Authorization: `Bearer ${token}` });
+
+  test('citizens and dispatchers cannot list users; a state admin sees only their own state staff', async () => {
     const { token: citizen } = await makeUser('citizen');
     const { token: dispatcher } = await makeUser('dispatcher');
     const { token: admin } = await makeUser('admin');
+    await makeUser('dispatcher', 'mh-disp@city.gov', 'india/maharashtra');
 
-    assert.equal((await request(app).get('/api/v1/users').set('Authorization', `Bearer ${citizen}`)).status, 403);
-    assert.equal((await request(app).get('/api/v1/users').set('Authorization', `Bearer ${dispatcher}`)).status, 403);
+    assert.equal((await request(app).get('/api/v1/users').set(as(citizen))).status, 403);
+    assert.equal((await request(app).get('/api/v1/users').set(as(dispatcher))).status, 403);
 
-    const res = await request(app).get('/api/v1/users?role=citizen').set('Authorization', `Bearer ${admin}`);
+    const res = await request(app).get('/api/v1/users').set(as(admin));
     assert.equal(res.status, 200);
-    assert.equal(res.body.total, 1);
-    assert.equal(res.body.data[0].passwordHash, undefined);
+    assert.deepEqual(res.body.data.map((u) => u.role).sort(), ['admin', 'dispatcher'], 'own state only, no citizens');
+    assert.ok(res.body.data.every((u) => u.region === 'india/karnataka' && u.passwordHash === undefined));
+    assert.equal((await request(app).get('/api/v1/users?role=citizen').set(as(admin))).status, 403);
   });
 
-  test('dispatchers can list assignable staff; citizens cannot', async () => {
+  test('superadmin sees everyone and can search; regex characters are treated literally', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    await User.create({ name: 'Asha Rao', email: 'asha@mail.com', passwordHash: 'x' });
+    await User.create({ name: 'Ravi', email: 'ravi@corp.io', passwordHash: 'x' });
+
+    const byName = await request(app).get('/api/v1/users?q=asha').set(as(sa));
+    assert.deepEqual(byName.body.data.map((u) => u.email), ['asha@mail.com']);
+    const byEmail = await request(app).get('/api/v1/users?q=CORP.IO').set(as(sa));
+    assert.deepEqual(byEmail.body.data.map((u) => u.name), ['Ravi']);
+    const regexy = await request(app).get('/api/v1/users?q=.*').set(as(sa));
+    assert.equal(regexy.status, 200);
+    assert.equal(regexy.body.total, 0, '".*" is matched literally, not as a wildcard');
+  });
+
+  test('assignable staff list is limited to the same state', async () => {
     const { token: citizen } = await makeUser('citizen');
     const { token: dispatcher } = await makeUser('dispatcher');
     await makeUser('admin');
+    await makeUser('dispatcher', 'mh@city.gov', 'india/maharashtra');
 
-    assert.equal((await request(app).get('/api/v1/users/dispatchers').set('Authorization', `Bearer ${citizen}`)).status, 403);
-    const res = await request(app).get('/api/v1/users/dispatchers').set('Authorization', `Bearer ${dispatcher}`);
-    assert.equal(res.status, 200);
+    assert.equal((await request(app).get('/api/v1/users/dispatchers').set(as(citizen))).status, 403);
+    const res = await request(app).get('/api/v1/users/dispatchers').set(as(dispatcher));
     assert.deepEqual(res.body.data.map((u) => u.role).sort(), ['admin', 'dispatcher']);
+    assert.ok(res.body.data.every((u) => u.region === 'india/karnataka'));
   });
 
-  test('admin promotes a citizen; the new role applies to their existing token immediately', async () => {
-    const { user, token: citizenToken } = await makeUser('citizen');
+  test('state admin creates a dispatcher for THEIR state with a one-time temporary password', async () => {
     const { token: admin } = await makeUser('admin');
-
     const res = await request(app)
-      .patch(`/api/v1/users/${user._id}/role`)
-      .set('Authorization', `Bearer ${admin}`)
-      .send({ role: 'dispatcher' });
-    assert.equal(res.status, 200);
+      .post('/api/v1/users/staff')
+      .set(as(admin))
+      .send({ name: 'New Disp', email: 'new@city.gov', state: 'Maharashtra' }); // state is ignored for admins
+    assert.equal(res.status, 201);
     assert.equal(res.body.user.role, 'dispatcher');
+    assert.equal(res.body.user.region, 'india/karnataka', 'admins can only staff their own state');
+    assert.match(res.body.temporaryPassword, /^[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/);
 
-    const staff = await request(app).get('/api/v1/users/dispatchers').set('Authorization', `Bearer ${citizenToken}`);
-    assert.equal(staff.status, 200);
+    const stored = await User.findOne({ email: 'new@city.gov' }).select('+passwordHash');
+    assert.equal(stored.mustChangePassword, true);
+    assert.notEqual(stored.passwordHash, res.body.temporaryPassword);
   });
 
-  test('role change validates input and blocks self-demotion', async () => {
-    const { user: adminUser, token: admin } = await makeUser('admin');
-    const auth = { Authorization: `Bearer ${admin}` };
+  test('new dispatcher must change the temporary password before using the app', async () => {
+    const { token: admin } = await makeUser('admin');
+    const created = await request(app).post('/api/v1/users/staff').set(as(admin)).send({ name: 'D', email: 'd@city.gov' });
+    const temp = created.body.temporaryPassword;
 
+    const login = await request(app).post('/api/v1/auth/login').send({ email: 'd@city.gov', password: temp });
+    assert.equal(login.status, 200);
+    assert.equal(login.body.user.mustChangePassword, true);
+    const t = login.body.token;
+
+    const blocked = await request(app).get('/api/v1/issues').set(as(t));
+    assert.equal(blocked.status, 403);
+    assert.equal(blocked.body.code, 'PASSWORD_CHANGE_REQUIRED');
+    assert.equal((await request(app).get('/api/v1/auth/me').set(as(t))).status, 200, '/me still works');
+
+    const wrong = await request(app).post('/api/v1/auth/change-password').set(as(t)).send({ currentPassword: 'nope-nope', newPassword: 'brand-new-pass' });
+    assert.equal(wrong.status, 401);
+    const same = await request(app).post('/api/v1/auth/change-password').set(as(t)).send({ currentPassword: temp, newPassword: temp });
+    assert.equal(same.status, 400);
+
+    const changed = await request(app).post('/api/v1/auth/change-password').set(as(t)).send({ currentPassword: temp, newPassword: 'brand-new-pass' });
+    assert.equal(changed.status, 200);
+    assert.equal(changed.body.user.mustChangePassword, false);
+    assert.equal((await request(app).get('/api/v1/issues').set(as(t))).status, 200, 'unlocked');
+    const oldLogin = await request(app).post('/api/v1/auth/login').send({ email: 'd@city.gov', password: temp });
+    assert.equal(oldLogin.status, 401, 'temp password no longer works');
+  });
+
+  test('state admin can reset or revoke only their own dispatchers', async () => {
+    const { token: admin } = await makeUser('admin');
+    const { user: mine } = await makeUser('dispatcher', 'mine@city.gov');
+    const { user: other } = await makeUser('dispatcher', 'other@city.gov', 'india/maharashtra');
+    const { user: peer } = await makeUser('admin', 'peer@city.gov');
+
+    const reset = await request(app).post(`/api/v1/users/${mine._id}/reset-password`).set(as(admin));
+    assert.equal(reset.status, 200);
+    assert.ok(reset.body.temporaryPassword);
+
+    assert.equal((await request(app).post(`/api/v1/users/${other._id}/reset-password`).set(as(admin))).status, 404, 'other state is invisible');
+    assert.equal((await request(app).patch(`/api/v1/users/${peer._id}/role`).set(as(admin)).send({ role: 'citizen' })).status, 404, 'cannot touch other admins');
+    assert.equal((await request(app).patch(`/api/v1/users/${mine._id}/role`).set(as(admin)).send({ role: 'admin' })).status, 403, 'cannot promote');
+
+    const revoke = await request(app).patch(`/api/v1/users/${mine._id}/role`).set(as(admin)).send({ role: 'citizen' });
+    assert.equal(revoke.status, 200);
+    assert.equal(revoke.body.user.role, 'citizen');
+    assert.equal(revoke.body.user.region, null);
+  });
+
+  test('superadmin sets roles with a state; nobody can grant superadmin via the API', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    const { user: citizen, token: citizenToken } = await makeUser('citizen');
+
+    const noState = await request(app).patch(`/api/v1/users/${citizen._id}/role`).set(as(sa)).send({ role: 'dispatcher' });
+    assert.equal(noState.status, 400, 'a dispatcher needs a state');
+
+    const ok = await request(app).patch(`/api/v1/users/${citizen._id}/role`).set(as(sa)).send({ role: 'dispatcher', state: 'Goa', country: 'India' });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.user.region, 'india/goa');
+    assert.equal(ok.body.user.regionName, 'Goa, India');
+    assert.equal((await request(app).get('/api/v1/users/dispatchers').set(as(citizenToken))).status, 200, 'new role applies to the existing token');
+
+    assert.equal((await request(app).patch(`/api/v1/users/${citizen._id}/role`).set(as(sa)).send({ role: 'superadmin' })).status, 403);
+  });
+
+  test('role change validates input and blocks changing yourself', async () => {
+    const { user: me, token: sa } = await makeUser('superadmin');
+    const auth = as(sa);
     assert.equal((await request(app).patch('/api/v1/users/not-an-id/role').set(auth).send({ role: 'admin' })).status, 400);
-    assert.equal((await request(app).patch(`/api/v1/users/${adminUser._id}/role`).set(auth).send({ role: 'god' })).status, 400);
-    assert.equal((await request(app).patch(`/api/v1/users/${adminUser._id}/role`).set(auth).send({ role: 'citizen' })).status, 400);
-    assert.equal((await request(app).patch('/api/v1/users/507f1f77bcf86cd799439011/role').set(auth).send({ role: 'admin' })).status, 404);
+    assert.equal((await request(app).patch(`/api/v1/users/${me._id}/role`).set(auth).send({ role: 'god' })).status, 400);
+    assert.equal((await request(app).patch(`/api/v1/users/${me._id}/role`).set(auth).send({ role: 'citizen' })).status, 400);
+    assert.equal((await request(app).patch('/api/v1/users/507f1f77bcf86cd799439011/role').set(auth).send({ role: 'citizen' })).status, 404);
+  });
+});
+
+describe('admin invites (state admins)', () => {
+  const as = (token) => ({ Authorization: `Bearer ${token}` });
+  const registerAdmin = (body) => request(app).post('/api/v1/auth/register-admin').send(body);
+
+  test('only the superadmin can create invites', async () => {
+    const { token: admin } = await makeUser('admin');
+    const { token: citizen } = await makeUser('citizen');
+    for (const t of [admin, citizen]) {
+      assert.equal((await request(app).post('/api/v1/invites').set(as(t)).send({ state: 'Kerala' })).status, 403);
+    }
+  });
+
+  test('an invite turns the registrant into that state admin, exactly once', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    const inv = await request(app).post('/api/v1/invites').set(as(sa)).send({ state: 'Kerala', country: 'India', note: 'Kerala PWD' });
+    assert.equal(inv.status, 201);
+    const { code } = inv.body;
+    assert.match(code, /^ADM-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/);
+    assert.equal(inv.body.invite.codeHash, undefined, 'hash never leaves the server');
+
+    // Lower-case and spaces are accepted.
+    const res = await registerAdmin({ code: code.toLowerCase().replace(/-/g, ' '), name: 'Kerala Admin', email: 'ka@kerala.gov', password: 'password123' });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.user.role, 'admin');
+    assert.equal(res.body.user.region, 'india/kerala');
+    assert.equal(res.body.permissions.canManageStaff, true);
+    assert.equal(res.body.permissions.canInviteAdmins, false);
+
+    const again = await registerAdmin({ code, name: 'X', email: 'x@kerala.gov', password: 'password123' });
+    assert.equal(again.status, 400, 'single use');
+
+    const list = await request(app).get('/api/v1/invites').set(as(sa));
+    assert.equal(list.body.data[0].status, 'used');
+    assert.equal(list.body.data[0].usedBy.email, 'ka@kerala.gov');
+  });
+
+  test('a duplicate email does not burn the invite', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    await makeUser('citizen', 'taken@mail.com');
+    const { code } = (await request(app).post('/api/v1/invites').set(as(sa)).send({ state: 'Goa' })).body;
+
+    assert.equal((await registerAdmin({ code, name: 'A', email: 'taken@mail.com', password: 'password123' })).status, 409);
+    assert.equal((await registerAdmin({ code, name: 'A', email: 'fresh@mail.com', password: 'password123' })).status, 201, 'still usable');
+  });
+
+  test('revoked, expired, and made-up codes are rejected with one generic message', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    const revoked = (await request(app).post('/api/v1/invites').set(as(sa)).send({ state: 'Goa' })).body;
+    assert.equal((await request(app).delete(`/api/v1/invites/${revoked.invite._id}`).set(as(sa))).status, 200);
+
+    const expired = (await request(app).post('/api/v1/invites').set(as(sa)).send({ state: 'Goa' })).body;
+    await Invite.updateOne({ _id: expired.invite._id }, { expiresAt: new Date(Date.now() - 1000) });
+
+    const messages = new Set();
+    let n = 0;
+    for (const code of [revoked.code, expired.code, 'ADM-FAKE-FAKE-FAKE']) {
+      n += 1;
+      const r = await registerAdmin({ code, name: 'A', email: `a${n}@x.io`, password: 'password123' });
+      assert.equal(r.status, 400);
+      messages.add(r.body.error);
+    }
+    assert.equal(messages.size, 1, 'no hint about why a code failed');
+  });
+
+  test('three people redeeming the same code at once: exactly one admin is created', async () => {
+    const { token: sa } = await makeUser('superadmin');
+    const { code } = (await request(app).post('/api/v1/invites').set(as(sa)).send({ state: 'Punjab' })).body;
+    const results = await Promise.all(
+      [1, 2, 3].map((i) => registerAdmin({ code, name: `A${i}`, email: `race${i}@x.io`, password: 'password123' }))
+    );
+    assert.deepEqual(results.map((r) => r.status).sort(), [201, 400, 400]);
+    assert.equal(await User.countDocuments({ role: 'admin', region: 'india/punjab' }), 1);
+  });
+
+  test('public registration can never produce staff, whatever is sent', async () => {
+    const res = await request(app).post('/api/v1/auth/register')
+      .send({ name: 'Sneaky', email: 'sneaky@x.io', password: 'password123', role: 'superadmin', region: 'india/karnataka' });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.user.role, 'citizen');
+    assert.equal(res.body.user.region, null);
   });
 });

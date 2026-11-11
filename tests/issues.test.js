@@ -23,9 +23,13 @@ const SPOT = { lat: 12.975, lng: 77.605 };
 const metersNorth = (m) => ({ lat: SPOT.lat + m / 111320, lng: SPOT.lng });
 
 let seq = 0;
-const makeUser = async (role = 'citizen') => {
+const makeUser = async (role = 'citizen', region = 'india/karnataka') => {
   seq += 1;
-  const user = await User.create({ name: `${role}${seq}`, email: `${role}${seq}@t.io`, passwordHash: 'x', role });
+  const scoped = role === 'dispatcher' || role === 'admin';
+  const user = await User.create({
+    name: `${role}${seq}`, email: `${role}${seq}@t.io`, passwordHash: 'x', role,
+    ...(scoped && { region, regionName: region }),
+  });
   return { user, auth: { Authorization: `Bearer ${signToken(user)}` } };
 };
 
@@ -156,7 +160,7 @@ describe('POST /issues — dedup + severity', () => {
 describe('severity decay', () => {
   test('stored score decays via the tick; reads show live score; floor holds', async () => {
     const issue = await Issue.create({
-      category: 'infra', location: { coordinates: [SPOT.lng, SPOT.lat] }, duplicateCount: 4,
+      category: 'infra', location: { coordinates: [SPOT.lng, SPOT.lat] }, duplicateCount: 4, region: 'india/karnataka',
     });
     assert.equal(issue.severityScore, 50); // 30 + 4*5
 
@@ -196,12 +200,17 @@ describe('GET /issues', () => {
     assert.equal(res.body.data[0].reporterIds.length, 2);
   });
 
-  test('citizens get the public view without reporter ids', async () => {
+  test('citizens cannot list all issues (they only see their own via /mine)', async () => {
     const a = await seed();
     const res = await request(app).get('/api/v1/issues').set(a.auth);
-    assert.equal(res.status, 200);
-    assert.ok(res.body.data.every((i) => i.reporterIds === undefined && i.assignedTo === undefined));
-    assert.ok(res.body.data.every((i) => i.reportedByMe === true));
+    assert.equal(res.status, 403);
+  });
+
+  test('staff list omits the (heavy) history; single view includes it', async () => {
+    await seed();
+    const { auth } = await makeUser('dispatcher');
+    const list = await request(app).get('/api/v1/issues').set(auth);
+    assert.ok(list.body.data.every((i) => i.history === undefined));
   });
 
   test('filters by category, status and bbox', async () => {
@@ -215,6 +224,11 @@ describe('GET /issues', () => {
 
     const resolved = await request(app).get('/api/v1/issues?status=resolved').set(auth);
     assert.equal(resolved.body.total, 0);
+
+    const severe = await request(app).get('/api/v1/issues?minSeverity=30').set(auth);
+    assert.deepEqual(severe.body.data.map((i) => i.severityScore), [55, 30]);
+    assert.equal((await request(app).get('/api/v1/issues?minSeverity=-1').set(auth)).status, 400);
+    assert.equal((await request(app).get('/api/v1/issues?minSeverity=abc').set(auth)).status, 400);
 
     assert.equal((await request(app).get('/api/v1/issues?status=closed').set(auth)).status, 400);
     assert.equal((await request(app).get('/api/v1/issues?bbox=1,2,3').set(auth)).status, 400);
@@ -255,8 +269,9 @@ describe('PATCH /issues/:id — Kanban workflow', () => {
     assert.equal((await patch(citizen.auth, id, { status: 'dispatched' })).status, 403);
   });
 
-  test('open → dispatched (with assignee) → resolved sets resolvedAt; reopen clears it', async () => {
+  test('dispatcher: open → dispatched (with assignee) → resolved sets resolvedAt; admin reopen clears it', async () => {
     const { dispatcher, id } = await setup();
+    const admin = await makeUser('admin');
 
     const d = await patch(dispatcher.auth, id, { status: 'dispatched', assignedTo: String(dispatcher.user._id) });
     assert.equal(d.status, 200);
@@ -267,16 +282,17 @@ describe('PATCH /issues/:id — Kanban workflow', () => {
     assert.equal(r.body.issue.status, 'resolved');
     assert.ok(r.body.issue.resolvedAt);
 
-    const o = await patch(dispatcher.auth, id, { status: 'open' });
+    const o = await patch(admin.auth, id, { status: 'open' });
     assert.equal(o.body.issue.status, 'open');
     assert.equal(o.body.issue.resolvedAt, null);
   });
 
   test('rejects invalid transitions and statuses', async () => {
     const { dispatcher, id } = await setup();
-    await patch(dispatcher.auth, id, { status: 'resolved' });
-    const bad = await patch(dispatcher.auth, id, { status: 'dispatched' });
-    assert.equal(bad.status, 400);
+    const admin = await makeUser('admin');
+    await patch(admin.auth, id, { status: 'resolved' });
+    const bad = await patch(admin.auth, id, { status: 'dispatched' });
+    assert.equal(bad.status, 400, 'resolved → dispatched is never allowed');
     assert.deepEqual(bad.body.details.allowed, ['open']);
     assert.equal((await patch(dispatcher.auth, id, { status: 'closed' })).status, 400);
     assert.equal((await patch(dispatcher.auth, id, {})).status, 400);
@@ -297,6 +313,95 @@ describe('PATCH /issues/:id — Kanban workflow', () => {
   });
 });
 
+describe('role hierarchy (citizen < dispatcher < admin)', () => {
+  const patch = (auth, id, body) => request(app).patch(`/api/v1/issues/${id}`).set(auth).send(body);
+  const freshIssue = async () => {
+    const c = await makeUser();
+    return (await report(c.auth, leak())).body.issue._id;
+  };
+
+  test('dispatcher cannot close an open issue without dispatching it (403); admin can', async () => {
+    const dispatcher = await makeUser('dispatcher');
+    const admin = await makeUser('admin');
+    const id = await freshIssue();
+
+    const denied = await patch(dispatcher.auth, id, { status: 'resolved' });
+    assert.equal(denied.status, 403);
+    assert.deepEqual(denied.body.details.allowed, ['dispatched'], 'tells the dispatcher what they can do');
+
+    const ok = await patch(admin.auth, id, { status: 'resolved' });
+    assert.equal(ok.status, 200);
+  });
+
+  test('dispatcher cannot reopen a resolved issue (403); admin can', async () => {
+    const dispatcher = await makeUser('dispatcher');
+    const admin = await makeUser('admin');
+    const id = await freshIssue();
+    await patch(dispatcher.auth, id, { status: 'dispatched' });
+    await patch(dispatcher.auth, id, { status: 'resolved' });
+
+    assert.equal((await patch(dispatcher.auth, id, { status: 'open' })).status, 403);
+    assert.equal((await patch(admin.auth, id, { status: 'open' })).status, 200);
+  });
+
+  test('dispatcher can undo a dispatch (dispatched → open)', async () => {
+    const dispatcher = await makeUser('dispatcher');
+    const id = await freshIssue();
+    await patch(dispatcher.auth, id, { status: 'dispatched' });
+    const undo = await patch(dispatcher.auth, id, { status: 'open' });
+    assert.equal(undo.status, 200);
+    assert.equal(undo.body.issue.status, 'open');
+  });
+
+  test('every staff action is recorded in the issue history (who, what, when)', async () => {
+    const dispatcher = await makeUser('dispatcher');
+    const admin = await makeUser('admin');
+    const id = await freshIssue();
+
+    await patch(dispatcher.auth, id, { status: 'dispatched', assignedTo: String(dispatcher.user._id) });
+    await patch(dispatcher.auth, id, { status: 'resolved' });
+    await patch(admin.auth, id, { status: 'open' });
+
+    const res = await request(app).get(`/api/v1/issues/${id}`).set(admin.auth);
+    const h = res.body.issue.history.map((e) => `${e.action}:${e.from}->${e.to}:${e.byRole}`);
+    assert.deepEqual(h, [
+      'status:open->dispatched:dispatcher',
+      `assignment:null->${dispatcher.user._id}:dispatcher`,
+      'status:dispatched->resolved:dispatcher',
+      'status:resolved->open:admin',
+    ]);
+    assert.equal(res.body.issue.history[1].toName, dispatcher.user.name);
+    assert.ok(res.body.issue.history.every((e) => e.byName && e.at));
+  });
+
+  test('citizens never see the staff history of their own report', async () => {
+    const citizen = await makeUser();
+    const dispatcher = await makeUser('dispatcher');
+    const id = (await report(citizen.auth, leak())).body.issue._id;
+    await patch(dispatcher.auth, id, { status: 'dispatched' });
+
+    const own = await request(app).get(`/api/v1/issues/${id}`).set(citizen.auth);
+    assert.equal(own.status, 200);
+    assert.equal(own.body.issue.history, undefined);
+    assert.equal(own.body.issue.assignedTo, undefined);
+  });
+
+  test('login and /me tell the UI what each role may do', async () => {
+    const { auth } = await makeUser('dispatcher');
+    const me = await request(app).get('/api/v1/auth/me').set(auth);
+    assert.deepEqual(me.body.permissions.transitions, { open: ['dispatched'], dispatched: ['resolved', 'open'] });
+    assert.equal(me.body.permissions.canViewAllIssues, true);
+    assert.equal(me.body.permissions.canManageStaff, false);
+    assert.equal(me.body.permissions.canInviteAdmins, false);
+    assert.equal(me.body.user.region, 'india/karnataka');
+
+    const citizen = await makeUser();
+    const cme = await request(app).get('/api/v1/auth/me').set(citizen.auth);
+    assert.deepEqual(cme.body.permissions.transitions, {});
+    assert.equal(cme.body.permissions.canViewAllIssues, false);
+  });
+});
+
 describe('GET /issues/stats', () => {
   test('staff-only dashboard numbers', async () => {
     const a = await makeUser();
@@ -310,7 +415,9 @@ describe('GET /issues/stats', () => {
 
     await request(app).patch(`/api/v1/issues/${leakIssue.body.issue._id}`).set(auth)
       .send({ status: 'dispatched', assignedTo: String(user._id) });
-    await request(app).patch(`/api/v1/issues/${pothole.body.issue._id}`).set(auth).send({ status: 'resolved' });
+    // Closing an open issue directly is an admin action.
+    const admin = await makeUser('admin');
+    await request(app).patch(`/api/v1/issues/${pothole.body.issue._id}`).set(admin.auth).send({ status: 'resolved' });
 
     assert.equal((await request(app).get('/api/v1/issues/stats').set(a.auth)).status, 403);
 
@@ -326,5 +433,78 @@ describe('GET /issues/stats', () => {
     assert.equal(s.resolvedToday, 1);
     assert.equal(s.duplicatesMerged, 1);
     assert.equal(typeof s.avgResolutionHours, 'number');
+  });
+});
+
+describe('jurisdiction: staff only see and act on their own state', () => {
+  const MUMBAI = { lat: 19.07, lng: 72.88 };
+  const patch = (auth, id, body) => request(app).patch(`/api/v1/issues/${id}`).set(auth).send(body);
+
+  const seedTwoStates = async () => {
+    const citizen = await makeUser();
+    const blr = (await report(citizen.auth, leak())).body.issue;
+    const bom = (await report(citizen.auth, leak(MUMBAI))).body.issue;
+    return { blr, bom };
+  };
+
+  test('each report is filed under the state its location is in', async () => {
+    const { blr, bom } = await seedTwoStates();
+    const a = await Issue.findById(blr._id).lean();
+    const b = await Issue.findById(bom._id).lean();
+    assert.equal(a.region, 'india/karnataka');
+    assert.equal(a.regionName, 'Karnataka, India');
+    assert.equal(b.region, 'india/maharashtra');
+  });
+
+  test('list, single view and stats are limited to the dispatcher state', async () => {
+    const { blr, bom } = await seedTwoStates();
+    const ka = await makeUser('dispatcher', 'india/karnataka');
+
+    const list = await request(app).get('/api/v1/issues').set(ka.auth);
+    assert.deepEqual(list.body.data.map((i) => i._id), [blr._id]);
+    assert.equal((await request(app).get(`/api/v1/issues/${bom._id}`).set(ka.auth)).status, 404, 'other state looks like it does not exist');
+
+    const stats = await request(app).get('/api/v1/issues/stats').set(ka.auth);
+    assert.equal(stats.body.data.active, 1);
+  });
+
+  test('staff cannot change another state issue or assign another state staff', async () => {
+    const { blr, bom } = await seedTwoStates();
+    const kaAdmin = await makeUser('admin', 'india/karnataka');
+    const mhDisp = await makeUser('dispatcher', 'india/maharashtra');
+
+    assert.equal((await patch(kaAdmin.auth, bom._id, { status: 'dispatched' })).status, 404);
+    const crossAssign = await patch(kaAdmin.auth, blr._id, { assignedTo: String(mhDisp.user._id) });
+    assert.equal(crossAssign.status, 400);
+    assert.match(crossAssign.body.error, /this state/);
+  });
+
+  test('superadmin sees every state and can filter by one', async () => {
+    const { bom } = await seedTwoStates();
+    const sa = await makeUser('superadmin');
+    const all = await request(app).get('/api/v1/issues').set(sa.auth);
+    assert.equal(all.body.total, 2);
+    const mh = await request(app).get('/api/v1/issues?region=india/maharashtra').set(sa.auth);
+    assert.deepEqual(mh.body.data.map((i) => i._id), [bom._id]);
+    assert.equal((await patch(sa.auth, bom._id, { status: 'resolved' })).status, 200, 'superadmin can act anywhere');
+  });
+
+  test('a dispatcher with no state assigned is refused, never shown everything', async () => {
+    await seedTwoStates();
+    const orphan = await User.create({ name: 'Orphan', email: 'orphan@t.io', passwordHash: 'x', role: 'dispatcher' });
+    const auth = { Authorization: `Bearer ${signToken(orphan)}` };
+    const res = await request(app).get('/api/v1/issues').set(auth);
+    assert.equal(res.status, 403);
+    assert.match(res.body.error, /no state assigned/);
+  });
+
+  test('if the state lookup fails the report is still accepted, filed as unassigned', async () => {
+    const citizen = await makeUser();
+    const res = await report(citizen.auth, leak({ lat: 51.5, lng: -0.12 })); // stub resolver: unknown area
+    assert.equal(res.status, 201);
+    assert.equal((await Issue.findById(res.body.issue._id).lean()).region, 'unassigned');
+    const sa = await makeUser('superadmin');
+    const list = await request(app).get('/api/v1/issues?region=unassigned').set(sa.auth);
+    assert.equal(list.body.total, 1, 'superadmin can find and handle unassigned reports');
   });
 });

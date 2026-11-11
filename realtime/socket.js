@@ -24,9 +24,20 @@ const { verifyToken } = require('../services/auth');
 const { issueEvents } = require('../services/events');
 const { withLiveSeverity } = require('../services/issues');
 const { corsOptions } = require('../config/cors');
-const { GEOHASH_ROOM_PRECISION } = require('../config/constants');
+const { GEOHASH_ROOM_PRECISION, STAFF_ROLES } = require('../config/constants');
 
-const STAFF = ['dispatcher', 'admin'];
+const STAFF = STAFF_ROLES;
+const SUPERADMIN_ROOM = 'superadmins';
+
+/** Room a staff socket joins on connect: its state, or all states for superadmin. */
+const staffDefaultRoom = (user) => {
+  if (user.role === 'superadmin') return SUPERADMIN_ROOM;
+  if (['dispatcher', 'admin'].includes(user.role) && user.region) return `region:${user.region}`;
+  return null;
+};
+
+/** Geohash cell room, namespaced by state for scoped staff so areas never leak across states. */
+const scopedCellRoom = (user, cellRoom) => (user.role === 'superadmin' ? cellRoom : `r:${user.region}|${cellRoom}`);
 const MAX_ROOMS_PER_SOCKET = 400; // a whole city at precision 5 is ~60 cells
 
 const geoRoom = (geohash) => `gh:${geohash.slice(0, GEOHASH_ROOM_PRECISION)}`;
@@ -36,6 +47,7 @@ const publicView = (issue) => {
   const view = withLiveSeverity(issue);
   delete view.reporterIds;
   delete view.assignedTo;
+  delete view.history;
   delete view.__v;
   return view;
 };
@@ -81,7 +93,7 @@ const attachRealtime = (httpServer) => {
       if (!token) return next(new Error('Authentication required'));
       const claims = verifyToken(token);
       if (!mongoose.isValidObjectId(claims.sub)) return next(new Error('Invalid token'));
-      const user = await User.findById(claims.sub).select('name role').lean();
+      const user = await User.findById(claims.sub).select('name role region mustChangePassword').lean();
       if (!user) return next(new Error('Account no longer exists'));
       socket.data.user = user;
       return next();
@@ -94,18 +106,24 @@ const attachRealtime = (httpServer) => {
     const { user } = socket.data;
     socket.join(userRoom(user._id));
 
+    // Default ("whole jurisdiction") mode: staff hear every event in their scope.
+    const defaultRoom = staffDefaultRoom(user);
+    if (defaultRoom) socket.join(defaultRoom);
+
+    // Area mode (live map): narrow to geohash cells of the visible bbox, still
+    // within the user's state. Replaces the default room and any previous area.
     socket.on('subscribe', (payload, ack) => {
       const reply = typeof ack === 'function' ? ack : () => {};
       if (!STAFF.includes(user.role)) return reply({ ok: false, error: 'Only staff can subscribe to areas' });
+      if (!defaultRoom) return reply({ ok: false, error: 'Your account has no state assigned' });
 
       const { rooms, error } = roomsForBbox(payload?.bbox);
       if (error) return reply({ ok: false, error });
 
-      // Replace the previous area (e.g. after the map is panned).
       for (const room of socket.rooms) {
-        if (room.startsWith('gh:')) socket.leave(room);
+        if (room !== socket.id && room !== userRoom(user._id)) socket.leave(room);
       }
-      socket.join(rooms);
+      socket.join(rooms.map((cellRoom) => scopedCellRoom(user, cellRoom)));
       return reply({ ok: true, rooms: rooms.length });
     });
   });
@@ -114,12 +132,16 @@ const attachRealtime = (httpServer) => {
   const fanOut = (event, issue, reason) => {
     if (!issue?.geohash) return;
     const staffPayload = reason === undefined ? staffView(issue) : { issue: staffView(issue), reason };
-    io.to(geoRoom(issue.geohash)).emit(event, staffPayload);
+    const cell = geoRoom(issue.geohash);
+    const region = issue.region || 'unassigned';
+    // Never a global broadcast: only this issue's state (+ superadmins), by jurisdiction or by map area.
+    const staffRooms = [SUPERADMIN_ROOM, `region:${region}`, cell, `r:${region}|${cell}`];
+    io.to(staffRooms).emit(event, staffPayload); // Socket.io de-duplicates sockets in several rooms
 
     // Reporters hear about changes to their own issues (status moves, merges).
     if (event === 'issue:updated' && issue.reporterIds?.length) {
       const rooms = issue.reporterIds.map((id) => userRoom(String(id._id || id)));
-      io.to(rooms).except(geoRoom(issue.geohash)).emit(event, { issue: publicView(issue), reason });
+      io.to(rooms).except(staffRooms).emit(event, { issue: publicView(issue), reason });
     }
   };
 

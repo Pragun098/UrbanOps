@@ -8,7 +8,11 @@ const num = (value, fallback) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
-const ROLES = Object.freeze(['citizen', 'dispatcher', 'admin']);
+// citizen < dispatcher < admin (one state) < superadmin (platform owner, all states)
+const ROLES = Object.freeze(['citizen', 'dispatcher', 'admin', 'superadmin']);
+const STAFF_ROLES = Object.freeze(['dispatcher', 'admin', 'superadmin']);
+// Roles limited to their own region (state). Superadmin is not scoped.
+const SCOPED_ROLES = Object.freeze(['dispatcher', 'admin']);
 
 const ISSUE_STATUSES = Object.freeze(['open', 'dispatched', 'resolved']);
 
@@ -47,6 +51,8 @@ const GEOHASH_ROOM_PRECISION = num(process.env.GEOHASH_ROOM_PRECISION, 5); // ~4
 
 module.exports = {
   ROLES,
+  STAFF_ROLES,
+  SCOPED_ROLES,
   ISSUE_STATUSES,
   ISSUE_CATEGORIES,
   CATEGORY_BASE_WEIGHTS,

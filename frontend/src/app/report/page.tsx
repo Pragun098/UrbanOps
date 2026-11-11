@@ -2,14 +2,15 @@
 
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { FormEvent, useState } from "react";
+import { FormEvent, useCallback, useState } from "react";
+import type { UserPosition } from "@/components/map/UserLocation";
 import AppShell from "@/components/AppShell";
 import { api, errorMessage, type ReportResult } from "@/lib/api";
 import { REPORT_TYPES, issueRef } from "@/lib/format";
 
 const LiveMap = dynamic(() => import("../LiveMap"), { ssr: false });
 
-type Point = { lat: number; lng: number };
+type Point = { lat: number; lng: number; source: "gps" | "map"; accuracy?: number };
 
 export default function ReportPage() {
   return (
@@ -26,6 +27,12 @@ function ReportForm() {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<ReportResult | null>(null);
 
+  // GPS fixes from the map fill the pin automatically, until the user clicks the
+  // map themselves (a manual pin is never overwritten).
+  const handleLocate = useCallback((pos: UserPosition) => {
+    setPoint((p) => (p && p.source === "map" ? p : { lat: pos.lat, lng: pos.lng, source: "gps", accuracy: pos.accuracy }));
+  }, []);
+
   function locateMe() {
     if (!("geolocation" in navigator)) {
       setError("Your browser can't share its location. Click the map instead.");
@@ -35,7 +42,7 @@ function ReportForm() {
     setError(null);
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        setPoint({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        setPoint({ lat: pos.coords.latitude, lng: pos.coords.longitude, source: "gps", accuracy: pos.coords.accuracy });
         setLocating(false);
       },
       (err) => {
@@ -125,7 +132,9 @@ function ReportForm() {
         <div className="form-group">
           <label>Location</label>
           <div className={`location-readout mono ${point ? "set" : ""}`}>
-            {point ? `📍 ${point.lat.toFixed(5)}, ${point.lng.toFixed(5)}` : "No location yet. Click the map or use your location."}
+            {point
+              ? `📍 ${point.lat.toFixed(5)}, ${point.lng.toFixed(5)} · ${point.source === "gps" ? `from your GPS (±${Math.round(point.accuracy ?? 0)} m)` : "pinned on the map"}`
+              : "Finding your location… or click the map to place the pin."}
           </div>
           <button type="button" className="location-button" onClick={locateMe} disabled={locating}>
             {locating ? "Locating…" : "Use my current location"}
@@ -156,7 +165,14 @@ function ReportForm() {
         <header className="panel-header">
           <h2 className="panel-title">Click the map to place the pin</h2>
         </header>
-        <LiveMap issues={[]} onPick={(lat, lng) => setPoint({ lat, lng })} picked={point} showLegend={false} />
+        <LiveMap
+          issues={[]}
+          onPick={(lat, lng) => setPoint({ lat, lng, source: "map" })}
+          picked={point}
+          showLegend={false}
+          centerOnUser
+          onLocate={handleLocate}
+        />
       </section>
     </div>
   );

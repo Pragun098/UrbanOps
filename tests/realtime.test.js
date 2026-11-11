@@ -38,9 +38,13 @@ afterEach(() => {
 });
 
 let seq = 0;
-const makeUser = async (role = 'citizen') => {
+const makeUser = async (role = 'citizen', region = 'india/karnataka') => {
   seq += 1;
-  const user = await User.create({ name: `${role}${seq}`, email: `rt-${role}${seq}@t.io`, passwordHash: 'x', role });
+  const scoped = role === 'dispatcher' || role === 'admin';
+  const user = await User.create({
+    name: `${role}${seq}`, email: `rt-${role}${seq}@t.io`, passwordHash: 'x', role,
+    ...(scoped && { region, regionName: region }),
+  });
   const token = signToken(user);
   return { user, token, auth: { Authorization: `Bearer ${token}` } };
 };
@@ -110,27 +114,39 @@ describe('geohash rooms', () => {
     assert.equal(ack.ok, false);
   });
 
-  test('new issue reaches dispatchers watching that area, and nobody else', async () => {
-    const near = await connect((await makeUser('dispatcher')).token);
-    const far = await connect((await makeUser('dispatcher')).token);
-    const unsubscribed = await connect((await makeUser('dispatcher')).token);
+  test('new issue reaches that state staff (map area or whole state) and the superadmin, nobody else', async () => {
+    const near = await connect((await makeUser('dispatcher')).token); // Karnataka, watching Bengaluru
+    const wholeState = await connect((await makeUser('admin')).token); // Karnataka, no map area: state channel
+    const otherState = await connect((await makeUser('dispatcher', 'india/maharashtra')).token);
+    const superadmin = await connect((await makeUser('superadmin')).token);
     assert.equal((await subscribe(near, BLR_BBOX)).ok, true);
-    assert.equal((await subscribe(far, MUMBAI_BBOX)).ok, true);
 
     const citizen = await makeUser();
     const gotNear = nextEvent(near, 'issue:created');
-    const gotFar = nextEvent(far, 'issue:created');
-    const gotNone = nextEvent(unsubscribed, 'issue:created');
+    const gotState = nextEvent(wholeState, 'issue:created');
+    const gotOther = nextEvent(otherState, 'issue:created');
+    const gotSuper = nextEvent(superadmin, 'issue:created');
 
     const res = await report(citizen.auth, { subcategory: 'Water leak', location: SPOT });
     assert.equal(res.status, 201);
 
     const payload = await gotNear;
-    assert.ok(payload, 'dispatcher in the area receives the event');
+    assert.ok(payload, 'dispatcher watching the area receives it');
     assert.equal(payload._id, res.body.issue._id);
     assert.equal(payload.severityScore, 50);
-    assert.equal(await gotFar, null, 'dispatcher elsewhere does not');
-    assert.equal(await gotNone, null, 'no global broadcast');
+    assert.ok(await gotState, 'same-state admin receives it on the state channel');
+    assert.ok(await gotSuper, 'superadmin receives every state');
+    assert.equal(await gotOther, null, 'another state hears nothing: no global broadcast');
+  });
+
+  test('a map area never leaks events from a neighbouring state', async () => {
+    // A Maharashtra dispatcher looking at a map area INSIDE Karnataka still gets nothing from it.
+    const mh = await connect((await makeUser('dispatcher', 'india/maharashtra')).token);
+    assert.equal((await subscribe(mh, BLR_BBOX)).ok, true);
+    const got = nextEvent(mh, 'issue:created');
+    const citizen = await makeUser();
+    await report(citizen.auth, { subcategory: 'Pothole', location: SPOT });
+    assert.equal(await got, null);
   });
 
   test('duplicate merge pushes the new severity to the area', async () => {

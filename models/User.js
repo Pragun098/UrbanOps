@@ -38,9 +38,17 @@ const UserSchema = new Schema(
       type: String,
       trim: true,
     },
+    // Jurisdiction for dispatchers/admins, e.g. "india/karnataka". Unused for citizens/superadmin.
+    region: { type: String, default: null },
+    regionName: { type: String, default: null },
+    // Set when an admin creates the account with a temporary password.
+    mustChangePassword: { type: Boolean, default: false },
+    createdBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
   },
   { timestamps: true }
 );
+
+UserSchema.index({ region: 1, role: 1 });
 
 // Strip secrets from any JSON response
 UserSchema.set('toJSON', {

@@ -3,4 +3,5 @@ module.exports = {
   User: require('./User'),
   Issue: require('./Issue'),
   RawData: require('./RawData'),
+  Invite: require('./Invite'),
 };

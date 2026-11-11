@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import AppShell from "@/components/AppShell";
 import { api, errorMessage, type Issue, type Paged, type Stats } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { COVERAGE_BBOX, useIssueStream, type IssueEvent } from "@/lib/socket";
+import { useIssueStream, type IssueEvent } from "@/lib/socket";
 import { STATUS_LABEL, issuePlace, issueRef, issueTitle, priorityOf, timeAgo, upsertBySeverity } from "@/lib/format";
 
 const LiveMap = dynamic(() => import("./LiveMap"), { ssr: false });
@@ -17,7 +17,7 @@ export default function Dashboard() {
   return (
     <AppShell
       title="Dashboard"
-      roles={["dispatcher", "admin"]}
+      roles={["dispatcher", "admin", "superadmin"]}
       actions={
         <Link href="/report" className="report-button">
           [+] Report incident
@@ -88,7 +88,7 @@ function DashboardBody() {
     [loadStats]
   );
 
-  const live = useIssueStream(token, handleEvent, COVERAGE_BBOX);
+  const { connected: live } = useIssueStream(token, handleEvent);
 
   const categories = stats ? Object.entries(stats.openByCategory) : [];
 
@@ -149,7 +149,7 @@ function DashboardBody() {
               <span className="live-dot" /> {live ? "LIVE" : "OFFLINE"}
             </span>
           </header>
-          <LiveMap issues={issues} />
+          <LiveMap issues={issues} centerOnUser />
         </section>
       </div>
 
