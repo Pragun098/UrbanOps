@@ -13,6 +13,7 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 const { getJwtSecret } = require('./services/auth');
 const { startDecayTicker } = require('./services/decay');
+const { attachRealtime } = require('./realtime/socket');
 
 const startServer = async () => {
   // Fail at boot (not on first login) if JWT_SECRET is missing in production.
@@ -33,8 +34,19 @@ const startServer = async () => {
   startDecayTicker();
 
   const server = http.createServer(app);
+  attachRealtime(server);
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(
+        `[UrbanOps Server] Port ${PORT} is already in use by another program.\n` +
+          `  Fix: set a different PORT in .env (e.g. PORT=5001), or stop the program using port ${PORT}.`
+      );
+      process.exit(1);
+    }
+    throw err;
+  });
   server.listen(PORT, () => {
-    console.log(`[UrbanOps Server] Listening on http://localhost:${PORT} (${process.env.NODE_ENV || 'development'})`);
+    console.log(`[UrbanOps Server] Listening on http://localhost:${PORT} (${process.env.NODE_ENV || 'development'}), live updates via Socket.io`);
   });
   return server;
 };

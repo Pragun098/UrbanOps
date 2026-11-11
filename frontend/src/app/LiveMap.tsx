@@ -1,223 +1,123 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import {
-  MapContainer,
-  TileLayer,
-  Marker,
-  Popup,
-} from "react-leaflet";
+/**
+ * Leaflet map of real issues. Load with next/dynamic({ ssr: false }).
+ *
+ * - issues:  markers coloured by severity priority
+ * - onPick:  if set, clicking the map picks a location (report form)
+ * - picked:  the currently picked location, shown as a pin
+ */
+
+import { MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
+import { useEffect } from "react";
+import type { Issue } from "@/lib/api";
+import { STATUS_LABEL, issuePlace, issueRef, issueTitle, priorityOf, timeAgo, type Priority } from "@/lib/format";
 
-type Priority = "high" | "medium" | "low";
+const BENGALURU: [number, number] = [12.9716, 77.5946];
 
-type Incident = {
-  id: string;
-  title: string;
-  location: string;
-  priority: Priority;
-  reports: number;
-  position: [number, number];
+const icons: Record<Priority, L.DivIcon> = {
+  high: L.divIcon({ className: "civic-marker high", html: '<div class="pulse-ring"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }),
+  medium: L.divIcon({ className: "civic-marker medium", html: "", iconSize: [14, 14], iconAnchor: [7, 7] }),
+  low: L.divIcon({ className: "civic-marker low", html: "", iconSize: [14, 14], iconAnchor: [7, 7] }),
 };
 
-const incidents: Incident[] = [
-  {
-    id: "INC-1042",
-    title: "Water leak",
-    location: "MG Road, District 04",
-    priority: "high",
-    reports: 8,
-    position: [12.9750, 77.6050],
-  },
-  {
-    id: "INC-1041",
-    title: "Road hazard",
-    location: "12th Main, District 04",
-    priority: "high",
-    reports: 5,
-    position: [12.9810, 77.6150],
-  },
-  {
-    id: "INC-1040",
-    title: "Pothole",
-    location: "Church Street, District 03",
-    priority: "medium",
-    reports: 3,
-    position: [12.9745, 77.6000],
-  },
-  {
-    id: "INC-1039",
-    title: "Street light",
-    location: "Indiranagar, District 02",
-    priority: "low",
-    reports: 2,
-    position: [12.9720, 77.6350],
-  },
-];
+const pickIcon = L.divIcon({ className: "pick-marker", html: "", iconSize: [18, 18], iconAnchor: [9, 9] });
 
-const createCivicIcon = (level: Priority) => {
-  const pulseHtml =
-    level === "high"
-      ? '<div class="pulse-ring"></div>'
-      : "";
+const SEVERITY_COLOR: Record<Priority, string> = {
+  high: "#CC3333",
+  medium: "#D97706",
+  low: "#4A7C59",
+};
 
-  return L.divIcon({
-    className: `civic-marker ${level}`,
-    html: pulseHtml,
-    iconSize: [14, 14],
-    iconAnchor: [7, 7],
+function ClickToPick({ onPick }: { onPick: (lat: number, lng: number) => void }) {
+  useMapEvents({
+    click(e) {
+      onPick(e.latlng.lat, e.latlng.lng);
+    },
   });
-};
+  return null;
+}
 
-const highPriorityIcon = createCivicIcon("high");
-const mediumPriorityIcon = createCivicIcon("medium");
-const lowPriorityIcon = createCivicIcon("low");
-
-const getIcon = (priority: Priority) => {
-  if (priority === "high") {
-    return highPriorityIcon;
-  }
-
-  if (priority === "medium") {
-    return mediumPriorityIcon;
-  }
-
-  return lowPriorityIcon;
-};
-
-export default function LiveMap() {
-  const [isMounted, setIsMounted] = useState(false);
-
+function FlyTo({ target }: { target: { lat: number; lng: number } | null | undefined }) {
+  const map = useMap();
   useEffect(() => {
-    setIsMounted(true);
+    if (target) map.flyTo([target.lat, target.lng], Math.max(map.getZoom(), 16), { duration: 0.6 });
+  }, [map, target]);
+  return null;
+}
 
-    return () => {
-      setIsMounted(false);
-    };
-  }, []);
+type Props = {
+  issues: Issue[];
+  onPick?: (lat: number, lng: number) => void;
+  picked?: { lat: number; lng: number } | null;
+  showLegend?: boolean;
+};
 
-  if (!isMounted) {
-    return (
-      <div
-        className="map-wrapper"
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        <span className="mono">
-          Loading geospatial data...
-        </span>
-      </div>
-    );
-  }
-
-  const position: [number, number] = [
-    12.9716,
-    77.5946,
-  ];
-
+export default function LiveMap({ issues, onPick, picked, showLegend = true }: Props) {
   return (
-    <div
-      className="map-wrapper"
-      style={{
-        position: "relative",
-        width: "100%",
-        height: "100%",
-      }}
-    >
-      <MapContainer
-        center={position}
-        zoom={13}
-        scrollWheelZoom={true}
-        style={{
-          height: "100%",
-          width: "100%",
-        }}
-      >
+    <div className="map-wrapper" style={{ position: "relative", width: "100%", height: "100%" }}>
+      <MapContainer center={BENGALURU} zoom={13} scrollWheelZoom style={{ height: "100%", width: "100%" }}>
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
           url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
 
-        {incidents.map((incident) => (
-          <Marker
-            key={incident.id}
-            position={incident.position}
-            icon={getIcon(incident.priority)}
-          >
-            <Popup>
-              <div
-                className="mono"
-                style={{
-                  fontSize: "12px",
-                  lineHeight: "1.6",
-                  minWidth: "180px",
-                }}
-              >
-                <strong>
-                  [{incident.id}] {incident.title}
-                </strong>
+        {onPick && <ClickToPick onPick={onPick} />}
+        <FlyTo target={picked} />
 
-                <br />
+        {picked && <Marker position={[picked.lat, picked.lng]} icon={pickIcon} />}
 
-                {incident.location}
-
-                <br />
-
-                <span
-                  style={{
-                    color:
-                      incident.priority === "high"
-                        ? "#CC3333"
-                        : incident.priority === "medium"
-                        ? "#D97706"
-                        : "#4A7C59",
-                    fontWeight: 600,
-                  }}
-                >
-                  PRIORITY:{" "}
-                  {incident.priority.toUpperCase()}
-                </span>
-
-                <br />
-
-                Reports: {incident.reports}
-              </div>
-            </Popup>
-          </Marker>
-        ))}
+        {issues.map((issue) => {
+          const [lng, lat] = issue.location.coordinates;
+          const priority = priorityOf(issue.severityScore);
+          return (
+            <Marker key={issue._id} position={[lat, lng]} icon={icons[priority]}>
+              <Popup>
+                <div className="mono" style={{ fontSize: "12px", lineHeight: 1.6, minWidth: "190px" }}>
+                  <strong>
+                    [{issueRef(issue)}] {issueTitle(issue)}
+                  </strong>
+                  <br />
+                  {issuePlace(issue)}
+                  <br />
+                  <span style={{ color: SEVERITY_COLOR[priority], fontWeight: 600 }}>
+                    SEVERITY: {issue.severityScore} ({priority.toUpperCase()})
+                  </span>
+                  <br />
+                  Status: {STATUS_LABEL[issue.status]}
+                  {issue.assignedTo ? ` → ${issue.assignedTo.name}` : ""}
+                  <br />
+                  Reports: {issue.reportCount} · last {timeAgo(issue.lastReportedAt)}
+                </div>
+              </Popup>
+            </Marker>
+          );
+        })}
       </MapContainer>
 
-      {/* Map Legend */}
-      <div className="map-legend">
-        <div className="legend-title">
-          INCIDENT PRIORITY
-        </div>
+      {showLegend && (
+        <>
+          <div className="map-legend">
+            <div className="legend-title">SEVERITY</div>
+            <div className="legend-item">
+              <span className="legend-marker high"></span>High (50+)
+            </div>
+            <div className="legend-item">
+              <span className="legend-marker medium"></span>Medium (30–49)
+            </div>
+            <div className="legend-item">
+              <span className="legend-marker low"></span>Low (&lt;30)
+            </div>
+          </div>
 
-        <div className="legend-item">
-          <span className="legend-marker high"></span>
-          High
-        </div>
-
-        <div className="legend-item">
-          <span className="legend-marker medium"></span>
-          Medium
-        </div>
-
-        <div className="legend-item">
-          <span className="legend-marker low"></span>
-          Low
-        </div>
-      </div>
-
-      {/* Incident Counter */}
-      <div className="map-counter">
-        <strong>{incidents.length}</strong>
-        <span> active incidents</span>
-      </div>
+          <div className="map-counter">
+            <strong>{issues.length}</strong>
+            <span> active incidents</span>
+          </div>
+        </>
+      )}
     </div>
   );
 }

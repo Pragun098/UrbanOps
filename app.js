@@ -7,6 +7,7 @@ const express = require('express');
 const cors = require('cors');
 
 const { isDbReady } = require('./config/db');
+const { corsOptions } = require('./config/cors');
 const telemetryRoutes = require('./routes/telemetry');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
@@ -23,15 +24,7 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
-const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:3000')
-  .split(',')
-  .map((o) => o.trim());
-app.use(
-  cors({
-    origin: allowedOrigins.includes('*') ? '*' : allowedOrigins,
-    credentials: !allowedOrigins.includes('*'),
-  })
-);
+app.use(cors(corsOptions));
 
 // Health check reports DB state so monitors can tell "up" from "up but useless".
 app.get('/api/health', (req, res) => {

@@ -1,0 +1,217 @@
+"use client";
+
+/**
+ * Kanban board (PRD §6.4): Open → Dispatched → Resolved.
+ * Drag a card to another column or use its buttons. Changes made by other
+ * dispatchers arrive live over the socket.
+ */
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import AppShell from "@/components/AppShell";
+import { ApiError, api, errorMessage, type Issue, type IssueStatus, type Paged, type StaffRef } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+import { COVERAGE_BBOX, useIssueStream, type IssueEvent } from "@/lib/socket";
+import { STATUS_LABEL, issuePlace, issueRef, issueTitle, priorityOf, timeAgo } from "@/lib/format";
+
+const COLUMNS: IssueStatus[] = ["open", "dispatched", "resolved"];
+
+// Mirrors the backend's ALLOWED_TRANSITIONS.
+const TRANSITIONS: Record<IssueStatus, IssueStatus[]> = {
+  open: ["dispatched", "resolved"],
+  dispatched: ["resolved", "open"],
+  resolved: ["open"],
+};
+
+const ACTION_LABEL: Record<string, string> = {
+  "open>dispatched": "Dispatch →",
+  "open>resolved": "Close",
+  "dispatched>resolved": "Resolve ✓",
+  "dispatched>open": "← Back to open",
+  "resolved>open": "Reopen",
+};
+
+const RESOLVED_SHOWN = 30;
+
+async function fetchBoard(signal?: AbortSignal) {
+  const [active, resolved, people] = await Promise.all([
+    api<Paged<Issue>>("/issues?status=open,dispatched&limit=500", { signal }),
+    api<Paged<Issue>>(`/issues?status=resolved&sort=recent&limit=${RESOLVED_SHOWN}`, { signal }),
+    api<{ data: StaffRef[] }>("/users/dispatchers", { signal }),
+  ]);
+  return { issues: [...active.data, ...resolved.data], staff: people.data };
+}
+
+export default function IncidentsPage() {
+  return (
+    <AppShell title="Incidents" roles={["dispatcher", "admin"]}>
+      <Board />
+    </AppShell>
+  );
+}
+
+function Board() {
+  const { token, user } = useAuth();
+  const [issues, setIssues] = useState<Issue[]>([]);
+  const [staff, setStaff] = useState<StaffRef[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState<IssueStatus | null>(null);
+
+  const load = useCallback((signal?: AbortSignal) => {
+    fetchBoard(signal)
+      .then((board) => {
+        setIssues(board.issues);
+        setStaff(board.staff);
+        setError(null);
+      })
+      .catch((err) => {
+        if ((err as Error).name !== "AbortError") setError(errorMessage(err));
+      });
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    load(controller.signal);
+    return () => controller.abort();
+  }, [load]);
+
+  const handleEvent = useCallback((event: IssueEvent) => {
+    setIssues((list) => [...list.filter((i) => i._id !== event.issue._id), event.issue]);
+  }, []);
+  const live = useIssueStream(token, handleEvent, COVERAGE_BBOX);
+
+  const columns = useMemo(() => {
+    const byStatus: Record<IssueStatus, Issue[]> = { open: [], dispatched: [], resolved: [] };
+    for (const issue of issues) byStatus[issue.status].push(issue);
+    byStatus.open.sort((a, b) => b.severityScore - a.severityScore);
+    byStatus.dispatched.sort((a, b) => b.severityScore - a.severityScore);
+    byStatus.resolved.sort((a, b) => (b.resolvedAt || "").localeCompare(a.resolvedAt || ""));
+    byStatus.resolved = byStatus.resolved.slice(0, RESOLVED_SHOWN);
+    return byStatus;
+  }, [issues]);
+
+  const update = async (issue: Issue, body: { status?: IssueStatus; assignedTo?: string | null }) => {
+    setBusy(issue._id);
+    setError(null);
+    try {
+      const res = await api<{ issue: Issue }>(`/issues/${issue._id}`, { method: "PATCH", body });
+      setIssues((list) => list.map((i) => (i._id === issue._id ? res.issue : i)));
+    } catch (err) {
+      setError(errorMessage(err));
+      // Someone else changed it first: pull the latest board.
+      if (err instanceof ApiError && err.status === 409) load();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const move = (issue: Issue, status: IssueStatus) => {
+    if (issue.status === status) return;
+    if (!TRANSITIONS[issue.status].includes(status)) {
+      setError(`Can't move from ${STATUS_LABEL[issue.status]} to ${STATUS_LABEL[status]}.`);
+      return;
+    }
+    // Dispatching an unassigned issue assigns it to whoever dispatched it.
+    const body: { status: IssueStatus; assignedTo?: string } = { status };
+    if (status === "dispatched" && !issue.assignedTo && user) body.assignedTo = user._id;
+    update(issue, body);
+  };
+
+  return (
+    <>
+      <div className="board-toolbar">
+        <span className="mono muted">Drag cards between columns, or use the buttons. Highest severity first.</span>
+        <span className={`live-badge ${live ? "on" : ""}`}>
+          <span className="live-dot" /> {live ? "LIVE" : "OFFLINE"}
+        </span>
+      </div>
+      {error && <div className="alert error">{error}</div>}
+
+      <div className="kanban">
+        {COLUMNS.map((status) => (
+          <section
+            key={status}
+            className={`kanban-col panel ${dragOver === status ? "drag-over" : ""}`}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(status);
+            }}
+            onDragLeave={() => setDragOver(null)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(null);
+              const issue = issues.find((i) => i._id === e.dataTransfer.getData("text/plain"));
+              if (issue) move(issue, status);
+            }}
+          >
+            <header className="panel-header">
+              <h2 className="panel-title">{STATUS_LABEL[status]}</h2>
+              <span className="mono muted">
+                {columns[status].length}
+                {status === "resolved" ? " recent" : ""}
+              </span>
+            </header>
+
+            <div className="kanban-cards">
+              {columns[status].length === 0 && <div className="empty-state">Nothing here</div>}
+              {columns[status].map((issue) => {
+                const priority = priorityOf(issue.severityScore);
+                return (
+                  <article
+                    key={issue._id}
+                    className={`kanban-card ${priority} ${busy === issue._id ? "busy" : ""}`}
+                    draggable={busy !== issue._id}
+                    onDragStart={(e) => e.dataTransfer.setData("text/plain", issue._id)}
+                  >
+                    <div className="kanban-card-top">
+                      <strong>{issueTitle(issue)}</strong>
+                      <span className={`severity-text ${priority} mono`}>{issue.severityScore}</span>
+                    </div>
+                    <div className="incident-location">
+                      {issueRef(issue)} · {issue.reportCount} report{issue.reportCount === 1 ? "" : "s"} ·{" "}
+                      {timeAgo(status === "resolved" && issue.resolvedAt ? issue.resolvedAt : issue.lastReportedAt)}
+                    </div>
+                    <div className="kanban-place">{issuePlace(issue)}</div>
+                    {issue.description && <p className="kanban-desc">{issue.description}</p>}
+
+                    {status !== "resolved" && (
+                      <label className="assign-row">
+                        <span>Assigned</span>
+                        <select
+                          value={issue.assignedTo?._id || ""}
+                          disabled={busy === issue._id}
+                          onChange={(e) => update(issue, { assignedTo: e.target.value || null })}
+                        >
+                          <option value="">— unassigned —</option>
+                          {staff.map((s) => (
+                            <option key={s._id} value={s._id}>
+                              {s.name} ({s.role})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+
+                    <div className="card-actions">
+                      {TRANSITIONS[status].map((to) => (
+                        <button
+                          key={to}
+                          type="button"
+                          className={`btn-small ${to === "open" ? "secondary" : ""}`}
+                          disabled={busy === issue._id}
+                          onClick={() => move(issue, to)}
+                        >
+                          {ACTION_LABEL[`${status}>${to}`]}
+                        </button>
+                      ))}
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          </section>
+        ))}
+      </div>
+    </>
+  );
+}
